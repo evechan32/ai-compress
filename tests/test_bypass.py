@@ -8,8 +8,13 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 REPO = "/root/ai-compress"
 MODEL = "/models/qwen2.5-1.5b-instruct"
+
+if not os.path.exists(MODEL):
+    pytest.skip("服务器专用测试：缺少 vLLM 运行环境/模型路径", allow_module_level=True)
 
 _CODE = textwrap.dedent(f"""
     import sys
