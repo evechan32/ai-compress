@@ -72,6 +72,27 @@ def _gen_multiturn_scenes(rng: random.Random, out_path: str,
     print(f"multiturn: {len(scenes)} conversations -> {out_path}")
 
 
+def _gen_longqa_scenes(rng: random.Random, out_path: str) -> None:
+    scenes = []
+    for toks in (3000, 8000, 12000):
+        for _ in range(2):
+            code = "".join(rng.choices(string.ascii_uppercase + string.digits, k=6))
+            body = _filler_tokens(toks - 40)
+            scene_prompt = (
+                f"{body}\nIMPORTANT NOTE: The archive key for this vault is {code}.\n"
+                f"Question: What is the archive key for this vault? "
+                f"Answer with the key only."
+            )
+            scenes.append({
+                "type": "longqa", "doc_tokens": toks, "answer": code,
+                "prompt": scene_prompt,
+            })
+    with open(out_path, "w", encoding="utf-8") as f:
+        for s in scenes:
+            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    print(f"longqa: {len(scenes)} scenes -> {out_path}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="bench/data")
@@ -83,6 +104,7 @@ def main() -> None:
     rng = random.Random(args.seed)
     _gen_needle_scenes(rng, os.path.join(args.out_dir, "needle.jsonl"))
     _gen_multiturn_scenes(rng, os.path.join(args.out_dir, "multiturn.jsonl"))
+    _gen_longqa_scenes(rng, os.path.join(args.out_dir, "longqa.jsonl"))
 
 
 if __name__ == "__main__":

@@ -14,12 +14,12 @@ import os
 import time
 
 
-def _load_scenes(data_dir: str) -> tuple[list[dict], list[dict]]:
+def _load_scenes(data_dir: str) -> tuple[list[dict], list[dict], list[dict]]:
     def _read(name):
         with open(os.path.join(data_dir, name), encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
 
-    return _read("needle.jsonl"), _read("multiturn.jsonl")
+    return _read("needle.jsonl"), _read("longqa.jsonl"), _read("multiturn.jsonl")
 
 
 def _run_needle(llm, sampling, scenes) -> dict:
@@ -62,6 +62,21 @@ def _run_multiturn(llm, sampling, scenes) -> dict:
     return {"conversations": all_results, "wall_s": round(wall, 2)}
 
 
+def _run_longqa(llm, sampling, scenes) -> dict:
+    results = []
+    wall = 0.0
+    for s in scenes:
+        t0 = time.time()
+        out = llm.generate([s["prompt"]], sampling)[0]
+        wall += time.time() - t0
+        ans = out.outputs[0].text.strip()
+        results.append({
+            "doc_tokens": s["doc_tokens"], "gold": s["answer"],
+            "answer": ans, "hit": s["answer"] in ans,
+        })
+    return {"scenes": results, "wall_s": round(wall, 2)}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/models/qwen2.5-1.5b-instruct")
@@ -70,6 +85,7 @@ def main() -> None:
     ap.add_argument("--tag", required=True)
     ap.add_argument("--dtype", default="bfloat16", help="量化模型用 auto")
     ap.add_argument("--max-output-tokens", type=int, default=60)
+    ap.add_argument("--max-model-len", type=int, default=16384)
     ap.add_argument("--prefix-caching", action="store_true",
                     help="启用 vLLM prefix caching（默认关闭以对齐早期评测）")
     args = ap.parse_args()
@@ -78,10 +94,10 @@ def main() -> None:
     from vllm import LLM, SamplingParams
 
     os.makedirs(args.out, exist_ok=True)
-    needles, multies = _load_scenes(args.data)
+    needles, longqas, multies = _load_scenes(args.data)
 
     t_engine = time.time()
-    llm = LLM(model=args.model, dtype=args.dtype, max_model_len=8192,
+    llm = LLM(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len,
               gpu_memory_utilization=0.85, enforce_eager=True,
               enable_prefix_caching=args.prefix_caching)
     engine_load_s = round(time.time() - t_engine, 2)
@@ -89,6 +105,7 @@ def main() -> None:
 
     t0 = time.time()
     needle_res = _run_needle(llm, sampling, needles)
+    longqa_res = _run_longqa(llm, sampling, longqas)
     multi_res = _run_multiturn(llm, sampling, multies)
     total_wall = time.time() - t0
 
@@ -102,6 +119,7 @@ def main() -> None:
         "eval_wall_s": round(total_wall, 2),
         "throughput_tok_s": round(out_tok / total_wall, 2) if total_wall else None,
         "needle": needle_res,
+        "longqa": longqa_res,
         "multiturn": multi_res,
     }
     path = os.path.join(args.out, f"{args.tag}.json")

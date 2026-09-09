@@ -15,10 +15,12 @@ import json
 
 
 def _answers(m: dict) -> list[str]:
-    """按固定顺序抽取所有回答文本（needle 场景 + 多轮各 turn）。"""
     out: list[str] = []
     for s in m["needle"]["scenes"]:
         out.append(s["answer"])
+    if "longqa" in m:
+        for s in m["longqa"]["scenes"]:
+            out.append(s["answer"])
     for conv in m["multiturn"]["conversations"]:
         for t in conv["turns"]:
             out.append(t["answer"])
