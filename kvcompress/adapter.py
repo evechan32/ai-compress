@@ -21,6 +21,7 @@ logger = logging.getLogger("kvcompress")
 # 架构 -> 含该架构 Attention 层的 vllm 模型模块（随支持扩展增加）
 _ARCH_TO_MODULE = {
     "Qwen2ForCausalLM": "vllm.model_executor.models.qwen2",
+    "Qwen3ForCausalLM": "vllm.model_executor.models.qwen3",
 }
 
 _target_archs: frozenset[str] = frozenset()

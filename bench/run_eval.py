@@ -68,6 +68,7 @@ def main() -> None:
     ap.add_argument("--data", default="bench/data")
     ap.add_argument("--out", default="bench/out")
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--dtype", default="bfloat16", help="量化模型用 auto")
     ap.add_argument("--max-output-tokens", type=int, default=60)
     ap.add_argument("--prefix-caching", action="store_true",
                     help="启用 vLLM prefix caching（默认关闭以对齐早期评测）")
@@ -80,7 +81,7 @@ def main() -> None:
     needles, multies = _load_scenes(args.data)
 
     t_engine = time.time()
-    llm = LLM(model=args.model, dtype="bfloat16", max_model_len=8192,
+    llm = LLM(model=args.model, dtype=args.dtype, max_model_len=8192,
               gpu_memory_utilization=0.85, enforce_eager=True,
               enable_prefix_caching=args.prefix_caching)
     engine_load_s = round(time.time() - t_engine, 2)
