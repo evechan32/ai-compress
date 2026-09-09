@@ -69,6 +69,8 @@ def main() -> None:
     ap.add_argument("--out", default="bench/out")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--max-output-tokens", type=int, default=60)
+    ap.add_argument("--prefix-caching", action="store_true",
+                    help="启用 vLLM prefix caching（默认关闭以对齐早期评测）")
     args = ap.parse_args()
 
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -80,7 +82,7 @@ def main() -> None:
     t_engine = time.time()
     llm = LLM(model=args.model, dtype="bfloat16", max_model_len=8192,
               gpu_memory_utilization=0.85, enforce_eager=True,
-              enable_prefix_caching=False)
+              enable_prefix_caching=args.prefix_caching)
     engine_load_s = round(time.time() - t_engine, 2)
     sampling = SamplingParams(max_tokens=args.max_output_tokens, temperature=0.0)
 
