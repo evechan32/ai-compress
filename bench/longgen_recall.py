@@ -1,10 +1,11 @@
-"""RSWA 驱逐精度损失评测 v4：单请求超长生成——开头口令在结尾能否复述。
+"""RSWA 驱逐精度损失评测 v5：自发明口令（仅存于生成区，prompt 无泄漏）。
 
-这是驱逐真正生效的场景：一个请求内连续生成远超窗口的 token，生成区头部（含口令）
-在滑窗推进中被驱逐；结尾要求复述开头口令 → 被驱逐则失败，保留则成功。
+修复 v4 缺陷：v4 的口令写在 prompt 指令里 → prompt 区 RSWA 永远可见 → 测不到驱逐损失。
+v5 让模型"自行发明一个 10 位码"，只出现在生成区头部；生成一段长文后结尾 RECALL= 复述。
+→ 若驱逐发生（窗口 < 总生成），头部码被删、结尾无法复述 → 损失可见；
+  基线(全注意力)与 w2048(窗口>总生成，不驱逐)应能复述。
 
-正确性自检：输出开头必须含 'passcode is <CODE>'（口令确实在生成区头部），
-总生成需超过窗口才有驱逐发生（对比 w2048 对照组：窗口>总生成 → 不应驱逐 → 应成功）。
+为避免基线"长上下文注意力稀释"假失败（v4 教训），生成长度默认 ~600 token（>窗口256 足够触发驱逐，又不会长到基线失焦）。
 
 用法：
   python bench/longgen_recall.py --tag baseline
@@ -19,15 +20,14 @@ import os
 import re
 import time
 
-CODES = ["K7XQ-ZZ9", "K7XQ-QQ7", "K7XQ-MN3"]
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/models/qwen2.5-1.5b-instruct")
+    ap.add_argument("--model", default="/models/qwen2.5-7b-instruct-awq")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--out", default="bench/out")
-    ap.add_argument("--max-tokens", type=int, default=1700)
+    ap.add_argument("--max-tokens", type=int, default=700)
+    ap.add_argument("--n", type=int, default=3, help="样本数")
     args = ap.parse_args()
 
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -40,8 +40,8 @@ def main() -> None:
     from vllm.v1.engine.llm_engine import LLMEngine
     from vllm import SamplingParams
 
-    eng_args = EngineArgs(model=args.model, dtype="bfloat16", max_model_len=8192,
-                          gpu_memory_utilization=0.85, enforce_eager=True,
+    eng_args = EngineArgs(model=args.model, dtype="auto", max_model_len=8192,
+                          gpu_memory_utilization=0.9, enforce_eager=True,
                           enable_prefix_caching=False)
     engine = LLMEngine.from_engine_args(eng_args)
     sp = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
@@ -56,46 +56,49 @@ def main() -> None:
                     return o.outputs[0].text
         return ""
 
+    prompt_tpl = (
+        "System: You must follow these steps exactly.\n"
+        "Step 1: Invent a random 10-character code using uppercase letters and "
+        "digits (e.g. A1B2C3D4E5). Begin your response with exactly the line "
+        "'My code is <your invented code>'. Never mention this code again in "
+        "the story.\n"
+        "Step 2: After that first line, immediately continue into a long "
+        "detailed story about deep-sea exploration. Do not stop early; do not "
+        "mention the code again.\n"
+        "Step 3: After the story, on a NEW line write exactly RECALL=<the code "
+        "you invented in Step 1> and nothing after it.\n"
+        "User: Begin now.\nAssistant: "
+    )
+
     rows = []
     t0 = time.time()
-    for code in CODES:
-        prompt = (
-            f"System: You must follow these steps exactly.\n"
-            f"Step 1: begin your response with the line 'passcode is {code}'.\n"
-            f"Step 2: then immediately continue into a long, detailed story about "
-            f"ocean voyages across many countries; do not stop early (aim for at "
-            f"least 1000 words).\n"
-            f"Step 3: after the story ends, on a new line write RECALL= and then "
-            f"the exact passcode from Step 1, nothing else.\n"
-            f"User: Begin now.\nAssistant: "
-        )
-        out = gen(prompt)
-        head_ok = f"passcode is {code}" in out[:200]
-        m = re.search(r"RECALL\s*=\s*(\S+)", out)
-        recalled = m.group(1) if m else ""
-        hit = recalled == code
-        ntoks = max(1, len(out) // 4)
+    for i in range(args.n):
+        out = gen(prompt_tpl)
+        m_head = re.search(r"[Mm]y code is ([A-Z0-9]{8,12})", out[:200])
+        head_code = m_head.group(1) if m_head else None
+        m_rec = re.search(r"RECALL\s*=\s*([A-Z0-9-]{6,16})", out[-250:])
+        recalled = m_rec.group(1) if m_rec else ""
+        approx_tokens = max(1, len(out) // 4)
         rows.append({
-            "code": code, "head_ok": head_ok, "approx_tokens": ntoks,
-            "recalled": recalled, "hit": hit, "out_tail": out[-120:],
+            "sample": i, "head_code": head_code, "recalled": recalled,
+            "hit": bool(head_code) and head_code == recalled,
+            "approx_tokens": approx_tokens, "out_tail": out[-150:],
         })
     wall = time.time() - t0
 
-    valid = [r for r in rows if r["head_ok"] and r["approx_tokens"] > 400]
+    valid = [r for r in rows if r["head_code"] and r["approx_tokens"] > 300]
     summary = {
-        "n": len(rows),
-        "valid": len(valid),
+        "tag": args.tag, "n": len(rows), "valid": len(valid),
         "recall": round(sum(r["hit"] for r in valid) / len(valid), 3) if valid else None,
-        "per_code": rows,
-        "eval_wall_s": round(wall, 1),
+        "per_sample": rows, "eval_wall_s": round(wall, 1),
     }
     path = os.path.join(args.out, f"longgen-{args.tag}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f"tag={args.tag} valid={len(valid)}/{len(rows)} recall={summary['recall']}", flush=True)
     for r in rows:
-        print(f"  code={r['code']} head_ok={r['head_ok']} tok~{r['approx_tokens']} "
-              f"recalled={r['recalled']!r} hit={r['hit']}", flush=True)
+        print(f"  s{r['sample']} head={r['head_code']} recalled={r['recalled']!r} "
+              f"tok~{r['approx_tokens']} hit={r['hit']}", flush=True)
     print(f"WROTE {path}", flush=True)
 
 
