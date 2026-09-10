@@ -163,3 +163,14 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 - 结论：**丢弃 prompt 中段 KV 的散点策略损失显著**（激进配置近乎全错；温和配置仍损失过半），而保留全 prompt 的 RSWA 零损失。这量化了"散点 vs 连续保留"的差距。
 - 重要限定：本实验的散点选择是**位置式**（头段+窗口），**非 SnapKV/H2O 的注意力重要性选择**；后者会在同等预算下保留中段显著 token，损失应显著更低。故本表是散点策略的"损失上界/质量下界"。
 - 复现注意：SGLang scheduler 子进程为独立解释器，需在子进程可见处注册 backend。本机做法：将 `sglang_kvx` 放入 venv site-packages，并在 `sglang/srt/model_executor/model_runner_components/attention_backend_setup.py` 的 `_build_full_attention_backend_from_str` 中惰性 `import sglang_kvx`（见 sglang_kvx/README.md）。
+
+## 15. SGLang KV 槽位释放尝试（单请求成功，多请求触发调度器不变量失败）
+
+- 目标：让散点驱逐真正回收 KV 显存（当前只限制注意力）。
+- 单请求结果：`KVX free: dropped=306 slots avail 137645->137951`（可用槽 +306），生成正常，EXITCODE=0。
+- 多请求结果：触发 SGLang 调度器不变量检查 ——
+  `ValueError: pool memory leak detected! total=138047, available=137940, evictable=413 ...`
+  随后 SIGQUIT，EXITCODE=137。
+- 根因：在 backend 直接调用 `allocator.free` 并清零 `req_to_token`，与调度器的请求 KV 记账、radix cache 及不变量校验器不一致。
+- 结论：**backend-only 无法安全实现 KV 回收；真正的槽位释放需调度器级集成（fork 级改动）**。
+- 现状：回收路径由 `KVX_FREE=1` 门控，**默认关闭**（实验性，勿用于多请求）。

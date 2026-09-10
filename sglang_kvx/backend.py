@@ -14,12 +14,43 @@ from sglang.srt.layers.attention.attention_registry import register_attention_ba
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
 
+def _install_allocator_dedupe(allocator) -> None:
+    """让 allocator.free 幂等：忽略已在空闲集的槽，避免中途释放 + 请求结束重复释放。"""
+    if getattr(allocator, "_kvx_dedupe", False):
+        return
+    free_set: set[int] = set()
+    orig_free = allocator.free
+    orig_alloc = allocator.alloc
+
+    def free(idx):
+        lst = idx.tolist() if hasattr(idx, "tolist") else list(idx)
+        new = [i for i in lst if i not in free_set]
+        for i in new:
+            free_set.add(i)
+        if new:
+            t = torch.tensor(new, dtype=idx.dtype, device=idx.device)
+            orig_free(t)
+
+    def alloc(n):
+        out = orig_alloc(n)
+        if out is not None:
+            for i in (out.tolist() if hasattr(out, "tolist") else out):
+                free_set.discard(i)
+        return out
+
+    allocator.free = free
+    allocator.alloc = alloc
+    allocator._kvx_dedupe = True
+
+
 class ScatterTritonBackend(TritonAttnBackend):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._kvx_head = int(os.environ.get("KVX_HEAD", "64"))
         self._kvx_window = int(os.environ.get("KVX_WINDOW", "32"))
+        self._kvx_free = os.environ.get("KVX_FREE", "0") == "1"
         self._kvx_last_ptr = None
+        self._kvx_freed = False
 
     def init_forward_metadata(self, forward_batch):
         super().init_forward_metadata(forward_batch)
@@ -48,6 +79,22 @@ class ScatterTritonBackend(TritonAttnBackend):
                 keep = torch.cat(parts)
                 keep_rows.append(keep)
                 new_indptr.append(new_indptr[-1] + int(keep.numel()))
+                if self._kvx_free and i == 0 and not self._kvx_freed:
+                    allocator = self.token_to_kv_pool_allocator
+                    before = allocator.available_size()
+                    _install_allocator_dedupe(allocator)
+                    dropped = rows[head:end - start - win]
+                    allocator.free(dropped)
+                    try:
+                        row = int(forward_batch.req_pool_indices[i].item())
+                        self.req_to_token_pool.req_to_token[
+                            row, head:end - start - win
+                        ] = 0
+                    except Exception as e:
+                        print("KVX zero-row warn:", type(e).__name__, str(e)[:120], flush=True)
+                    self._kvx_freed = True
+                    print(f"KVX free: dropped={int(dropped.numel())} slots "
+                          f"avail {before}->{allocator.available_size()}", flush=True)
             fm.kv_indices = torch.cat(keep_rows) if keep_rows else old_idx[:0]
             fm.kv_indptr = torch.tensor(
                 new_indptr, dtype=fm.kv_indptr.dtype, device=fm.kv_indptr.device

@@ -53,3 +53,10 @@ SGLang 的 scheduler 是独立解释器，客户端里的 `import sglang_kvx` �
        pass
    ```
    （此处环境已完全就绪，避免 .pth 启动期导入过早的依赖问题。）
+
+
+## KVX_FREE（实验性，默认关闭）
+
+`KVX_FREE=1` 会尝试把丢弃的 KV 槽归还分配器（单请求实测可用槽 +306）。但**多请求运行会触发
+SGLang 调度器不变量 `pool memory leak detected`** —— 中途释放与调度器记账/radix cache 不一致。
+安全使用：仅单请求探索；生产需调度器级集成。默认关闭。
