@@ -36,3 +36,20 @@ e.generate("...", {"max_new_tokens": 16, "temperature": 0})
 1. 仅限制注意力可见范围，**未释放 KV 池槽位**（显存未回收）。
 2. 选择策略为**位置式**（头段+窗口），非 SnapKV 的 attention 重要性打分。
 3. 未做 baseline 对照的损失量化。
+
+
+## 子进程注册（必需）
+
+SGLang 的 scheduler 是独立解释器，客户端里的 `import sglang_kvx` 不会传播过去，会报
+`ValueError: Invalid attention backend: kvx_scatter`。本机可用做法：
+
+1. 将本包放入 venv site-packages：`cp -r sglang_kvx /root/sglang-venv/lib/python3.11/site-packages/`
+2. 在 `sglang/srt/model_executor/model_runner_components/attention_backend_setup.py` 的
+   `_build_full_attention_backend_from_str` 中、成员检查之前加惰性导入：
+   ```python
+   try:
+       import sglang_kvx  # 注册自定义 backend
+   except Exception:
+       pass
+   ```
+   （此处环境已完全就绪，避免 .pth 启动期导入过早的依赖问题。）

@@ -148,3 +148,18 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
   - 生成正常：`"(1) How many times does the letter 'o' appear in the sentence"`，EXITCODE=0
 - 结论：**散点 KV 注意力机制在 SGLang 自定义 backend 中可用**（SnapKV/H2O 的必要前提）。
 - 限制：① 未释放 KV 池槽位（显存未回收）；② 选择为位置式，非 attention 重要性（SnapKV 二期）；③ 未与 baseline 做损失量化。
+
+## 14. SGLang 散点驱逐损失量化（2026-09-10）
+
+同 24 条任务（needle 6 + longqa 6 + multiturn 12），temperature=0，SGLang triton 后端，`sglang_kvx` 散点 backend vs 完整注意力：
+
+| 配置（decode 保留：头段 + 末尾窗口） | 逐字一致率 | 平均相似度 | 差异条数 |
+|---|---|---|---|
+| 完整注意力（参照） | 1.0 | 1.0 | 0 |
+| 散点 head256 + win128 | 0.458 | 0.636 | 13/24 |
+| 散点 head64 + win32 | 0.042 | 0.282 | 23/24 |
+| 对照：vLLM RSWA 插件（保留全 prompt） | 1.0（24/24） | 1.0 | 0 |
+
+- 结论：**丢弃 prompt 中段 KV 的散点策略损失显著**（激进配置近乎全错；温和配置仍损失过半），而保留全 prompt 的 RSWA 零损失。这量化了"散点 vs 连续保留"的差距。
+- 重要限定：本实验的散点选择是**位置式**（头段+窗口），**非 SnapKV/H2O 的注意力重要性选择**；后者会在同等预算下保留中段显著 token，损失应显著更低。故本表是散点策略的"损失上界/质量下界"。
+- 复现注意：SGLang scheduler 子进程为独立解释器，需在子进程可见处注册 backend。本机做法：将 `sglang_kvx` 放入 venv site-packages，并在 `sglang/srt/model_executor/model_runner_components/attention_backend_setup.py` 的 `_build_full_attention_backend_from_str` 中惰性 `import sglang_kvx`（见 sglang_kvx/README.md）。
