@@ -205,3 +205,18 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 - 结论：注意力分数优于 V 范数，但仍劣于位置式。原因：本合成任务的关键信息位于 prompt 中段，任何丢弃中段的散点策略都损失；位置式胜出靠"末尾窗口"命中 longqa/多轮所需信息。
 - 判断：**合成 needle 不利于 SnapKV**；要评估其真实价值需真实长文冗余任务（LongBench 等）。
 - 代码：`KVX_IMPORTANCE=1`（+`KVX_BUDGET`/`KVX_WINDOW`/`KVX_OBS`），默认关闭。
+
+## 18. LongBench 子集真实长文评测（2026-09-11）
+
+数据：`ZhipuAI/LongBench`（ModelScope，data.zip 解压）→ qasper / 2wikimqa / multifieldqa_en，各 20 条，官方 F1 指标，temp=0。
+
+| 子集 | 完整注意力（triton） | 位置散点 h256+win128 | 重要性散点 top256+win128 |
+|---|---|---|---|
+| qasper | **0.3448** | 0.2166 | 0.1159 |
+| 2wikimqa | **0.1036** | 0.1027 | 0.0635 |
+| multifieldqa_en | **0.4326** | 0.2657 | 0.1853 |
+
+- 结论：真实长文任务上，完整注意力最优；**散点驱逐（位置与重要性）均显著掉分**；位置上仍优于本版重要性实现。
+- 对照：vLLM RSWA 插件保留全 prompt → 按构造等价完整注意力（合成 24/24 逐字一致）。
+- 实现局限（影响重要性分数公平性）：单层分数、观察窗口 32、未处理 chunked prefill（分块时打分只覆盖最后 chunk）——官方 SnapKV 可能更好，但本次未能超越位置式。
+- 脚本：`bench/sgl_longbench.py`；数据 `/hy-tmp/longbench/data/`。
