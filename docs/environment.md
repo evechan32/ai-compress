@@ -59,12 +59,19 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 ```
 若不设 `LD_LIBRARY_PATH`：`ImportError: ... libicui18n.so.78 ... CXXABI_1.3.15 not found`。
 
-## 5. SGLang 环境（未验证通过）
+## 5. SGLang 环境（已验证通过，需换后端）
 
 - `/root/sglang-venv`（virtualenv + system site packages）：**sglang 0.5.19 安装成功**。
-- 运行失败：`RuntimeError: FlashInfer requires GPUs with sm75 or higher`（SIGKILL, EXITCODE=137）。
-- 待排查方向：flashinfer 版本/CUDA 运行时匹配；禁用 flashinfer attention backend。
-- 另注：`Engine` 真实参数名为 `model_path`（`sglang.Engine` 是懒加载代理，`inspect.signature` 显示 `(module_name, class_name)`）。
+- 默认后端（flashinfer）失败：`RuntimeError: FlashInfer requires GPUs with sm75 or higher`（本机 FlashInfer 在 sm_120 + CUDA 12.8 下不可用）。
+- **可用配置 = 换 triton 后端**：
+  ```python
+  from sglang import Engine
+  e = Engine(model_path="/models/qwen2.5-1.5b-instruct", dtype="bfloat16",
+             attention_backend="triton", mem_fraction_static=0.6, disable_cuda_graph=True)
+  ```
+  实测：12s 就绪，生成正常（`' Paris. The capital of France is...'`），EXITCODE=0。
+- 可用后端清单（`sglang.srt.layers.attention.attention_registry.ATTENTION_BACKENDS`）含 `triton / torch_native / flex_attention / fa3 / fa4` 等，sm_120 下优先试 `triton`。
+- 注意：`Engine` 真实参数名为 `model_path`（`sglang.Engine` 是懒加载代理）。
 
 ## 6. 运维记录（重要）
 

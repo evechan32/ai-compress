@@ -98,13 +98,12 @@
 
 结论：损失量级仍为开放问题；需要能稳定执行长格式任务的模型（chat template + 关 thinking）才能测定。机制层面：被驱逐 token 的 KV 物理移除，依赖它的任务必然受影响。
 
-## 8. SGLang 验证（未通过）
+## 8. SGLang 验证（通过，需 triton 后端）
 
-- 安装：`/root/sglang-venv`（virtualenv + system site packages），**sglang 0.5.19 安装成功**。
-- 冒烟：`Engine(model_path=..., mem_fraction_static=0.6, disable_cuda_graph=True)` 启动失败：
-  - `RuntimeError: FlashInfer requires GPUs with sm75 or higher`
-  - `SIGQUIT/SIGKILL`，`EXITCODE=137`
-- 判断：SGLang 的 flashinfer 路径在 sm_120 + 本机 CUDA 12.8 运行时下能力检测失败（与 vLLM 早期 "SM 12.x requires CUDA >= 12.9" 同类问题）。**SGLang 尚未验证通过**。
+- 安装：`/root/sglang-venv`，sglang 0.5.19。
+- 默认 flashinfer 后端失败：`RuntimeError: FlashInfer requires GPUs with sm75 or higher`（EXITCODE=137）。
+- **换 `attention_backend="triton"` 后通过**：Engine 12s 就绪，生成 `' Paris. The capital of France is also the capital of which country?'`，EXITCODE=0。
+- 结论：SGLang 在本机可用（triton 后端）；这为后续用 SGLang 自定义 AttentionBackend 做散点驱逐（SnapKV/H2O）打通了环境前提。
 
 ## 9. 已验证的环境变量/命令备忘
 
