@@ -122,3 +122,11 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 - `/tmp/pc_run.log`、`/tmp/pc_plugin2.log`：prefix caching
 - `/tmp/lq_run.log`、`/tmp/q3_eval.log`：一致性评测
 - `/tmp/sgl_smoke2.log`：SGLang 冒烟失败
+
+## 11. FP8 KV（原生量化）对照——环境不可用
+
+- 目的：量化"原生 FP8 KV 量化"的逐字损失，对比我们的驱逐"逐字无损"。
+- 结果：`--kv-cache-dtype fp8 / fp8_e4m3` 引擎启动失败：
+  `RuntimeError: FlashInfer backend is not available. Please install the package to enable FlashInfer kernels`
+- 原因：vLLM 0.28 的 fp8 KV 由 FlashInfer 后端实现，本机 FlashInfer 因 sm_120/CUDA 12.8 不可用。
+- 结论：本环境无法产出 FP8 KV 对照数据；详见 `environment.md §8.2`。

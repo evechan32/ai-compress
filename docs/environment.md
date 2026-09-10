@@ -81,3 +81,17 @@ from modelscope import snapshot_download
 snapshot_download("Qwen/Qwen2.5-1.5B-Instruct", local_dir="/models/qwen2.5-1.5b-instruct")
 snapshot_download("Qwen/Qwen3-8B-AWQ", local_dir="/models/qwen3-8b-awq")
 ```
+
+## 8. 运维事件记录（2026-09-10）
+
+### 8.1 系统 vLLM 0.28.0 曾被源码构建误删（已恢复）
+- 现象：`/usr/local/lib/python3.11/dist-packages/vllm` 消失，系统 `python3` 报 `No module named 'vllm'`。
+- 根因：源码构建使用 `--system-site-packages` 的 venv，`pip install -e .` 通过系统路径看到同名 `vllm 0.28.0`，安装 dev 版本时卸载了系统 vllm。
+- 恢复：`/usr/local/bin/python3 -m pip install "vllm==0.28.0" --no-cache-dir` → 成功，导入验证 `0.28.0` 正常。
+- 教训：`--system-site-packages` 环境里安装与系统同名的包会误删系统安装；构建 vLLM 应用**独立（非 system-site-packages）环境**或显式 `--ignore-installed`。
+
+### 8.2 FP8 KV cache 在本环境不可用
+- 尝试：`--kv-cache-dtype fp8 / fp8_e4m3`（run_eval 已加 `--kv-cache-dtype` 参数）。
+- 结果：引擎启动失败 → `RuntimeError: FlashInfer backend is not available`。
+- 原因：vLLM 0.28 的 fp8 KV 路径实现在 **FlashInfer 后端**（`flashinfer.py` 有 fp8 KV 代码；`flash_attn.py` 无）；而本机 FlashInfer 在 sm_120 + CUDA 12.8 下不可用（需 CUDA ≥ 12.9）。
+- 结论：**在本机栈上，原生 FP8 KV 量化无法启用**；如需启用须安装/编译匹配 CUDA 13 的 FlashInfer（高风险环境改动，暂不做）。
