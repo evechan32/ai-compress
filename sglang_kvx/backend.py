@@ -49,8 +49,24 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_head = int(os.environ.get("KVX_HEAD", "64"))
         self._kvx_window = int(os.environ.get("KVX_WINDOW", "32"))
         self._kvx_free = os.environ.get("KVX_FREE", "0") == "1"
+        self._kvx_importance = os.environ.get("KVX_IMPORTANCE", "0") == "1"
+        self._kvx_budget = int(os.environ.get("KVX_BUDGET", "256"))
         self._kvx_last_ptr = None
         self._kvx_freed = False
+
+    def _importance_positions(self, rows, seq_len: int, budget: int, win: int):
+        try:
+            v = self.token_to_kv_pool.v_buffer[0][rows]
+            score = v.float().norm(dim=-1).norm(dim=-1)
+            k = min(budget, seq_len)
+            top = torch.topk(score, k).indices.tolist()
+            keep = set(top)
+            start = max(0, seq_len - win)
+            keep.update(range(start, seq_len))
+            return sorted(keep)
+        except Exception as e:
+            print("KVX importance warn:", type(e).__name__, str(e)[:150], flush=True)
+            return list(range(min(budget, seq_len))) + list(range(max(0, seq_len - win), seq_len))
 
     def init_forward_metadata(self, forward_batch):
         super().init_forward_metadata(forward_batch)
@@ -71,12 +87,17 @@ class ScatterTritonBackend(TritonAttnBackend):
                 s = int(seqlens[i])
                 start, end = old_indptr[i], old_indptr[i + 1]
                 rows = old_idx[start:end]
-                head = min(self._kvx_head, s)
-                win = min(self._kvx_window, max(0, s - head))
-                parts = [rows[:head]]
-                if win > 0:
-                    parts.append(rows[end - start - win:])
-                keep = torch.cat(parts)
+                win = min(self._kvx_window, max(0, s - self._kvx_budget))
+                if self._kvx_importance:
+                    sel = self._importance_positions(rows, s, self._kvx_budget, win)
+                    keep = rows[torch.tensor(sel, device=rows.device)]
+                else:
+                    head = min(self._kvx_head, s)
+                    win = min(self._kvx_window, max(0, s - head))
+                    parts = [rows[:head]]
+                    if win > 0:
+                        parts.append(rows[end - start - win:])
+                    keep = torch.cat(parts)
                 keep_rows.append(keep)
                 new_indptr.append(new_indptr[-1] + int(keep.numel()))
                 if self._kvx_free and i == 0 and not self._kvx_freed:

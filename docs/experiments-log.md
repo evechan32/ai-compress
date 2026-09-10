@@ -174,3 +174,17 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 - 根因：在 backend 直接调用 `allocator.free` 并清零 `req_to_token`，与调度器的请求 KV 记账、radix cache 及不变量校验器不一致。
 - 结论：**backend-only 无法安全实现 KV 回收；真正的槽位释放需调度器级集成（fork 级改动）**。
 - 现状：回收路径由 `KVX_FREE=1` 门控，**默认关闭**（实验性，勿用于多请求）。
+
+## 16. 重要性选择（V 范数代理）——劣于位置式
+
+在散点 backend 中以"KV 池 V 张量范数"作为重要性代理，取 top-B + 末尾窗口：
+
+| 选择策略（相近保留预算） | 逐字一致率 | 平均相似度 |
+|---|---|---|
+| 位置式 head256+win128（384） | 0.458 | 0.636 |
+| V 范数重要性 top256+win128 | 0.083 | 0.260 |
+| 位置式 head64+win32 | 0.042 | 0.282 |
+| V 范数重要性 top64+win32 | 0.000 | 0.092 |
+
+- 结论：**V 范数不是有效的显著性代理**，劣于位置式。真 SnapKV 使用**最后一层注意力分数**；需在 prefill 阶段做一次打分（我们可在自有 `forward_extend` 用 q/k 现算最后一层分数）。
+- 代码：`KVX_IMPORTANCE=1`（+`KVX_BUDGET`/`KVX_WINDOW`），默认关闭。
