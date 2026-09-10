@@ -138,3 +138,13 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
   - `Engine(model_path=..., attention_backend="kvx_triton", mem_fraction_static=0.6, disable_cuda_graph=True)` → 10s 就绪，生成 `' Paris. The capital of France is...'`，EXITCODE=0
 - 结论：**SGLang 的 attention backend 扩展点在本机（sm_120, triton 后端）可用** —— 这是零 fork 之外实现 SnapKV/H2O 散点驱逐的可行路径。
 - 脚本：`/tmp/sgl_custom_backend.py`、`/tmp/sgl_custom_smoke.py`（服务器）。
+
+## 13. SGLang 散点 KV 驱逐 backend 原型（通过，2026-09-10）
+
+- 代码：`sglang_kvx/`（`ScatterTritonBackend`，注册名 `kvx_scatter`）。
+- 机制确认：SGLang decode 用扁平 `kv_indices`（gather）——实测 `kv_indptr=[0,10]`、`kv_indices=[1..10]`（page_size=1，索引=token 位置），因此按索引子集过滤即可实现散点注意力。
+- 实测：prompt 402 token → 过滤为 head64+win32：
+  - `KVX decode filter: old_ptr=[0, 402] new_ptr=[0, 96]`
+  - 生成正常：`"(1) How many times does the letter 'o' appear in the sentence"`，EXITCODE=0
+- 结论：**散点 KV 注意力机制在 SGLang 自定义 backend 中可用**（SnapKV/H2O 的必要前提）。
+- 限制：① 未释放 KV 池槽位（显存未回收）；② 选择为位置式，非 attention 重要性（SnapKV 二期）；③ 未与 baseline 做损失量化。
