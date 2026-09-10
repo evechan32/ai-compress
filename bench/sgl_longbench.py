@@ -47,6 +47,7 @@ def main() -> None:
     ap.add_argument("--out", default="bench/out")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--attention-backend", default="triton")
+    ap.add_argument("--kv-cache-dtype", default="auto")
     ap.add_argument("--max-ctx-chars", type=int, default=20000)
     args = ap.parse_args()
 
@@ -55,7 +56,8 @@ def main() -> None:
     from bench.sgl_run_eval import SglLLM
 
     os.makedirs(args.out, exist_ok=True)
-    llm = SglLLM(args.model, args.attention_backend, 0.6)
+    llm = SglLLM(args.model, args.attention_backend, 0.6,
+                 kv_cache_dtype=args.kv_cache_dtype)
     sp = SimpleNamespace(max_tokens=32)
 
     per_file = {}
@@ -80,6 +82,7 @@ def main() -> None:
         print(f"{fn}: n={len(rows)} f1={per_file[fn]['f1']}", flush=True)
 
     payload = {"tag": args.tag, "backend": args.attention_backend,
+               "kv_cache_dtype": args.kv_cache_dtype,
                "per_file": per_file, "wall_s": round(time.time() - t0, 1)}
     path = os.path.join(args.out, f"lb-{args.tag}.json")
     with open(path, "w", encoding="utf-8") as f:

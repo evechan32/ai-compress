@@ -234,3 +234,17 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 - 结论：多层聚合与更大观察窗口**未改善**，重要性选择**始终显著劣于位置式**，二者均远低于完整注意力。
 - 综合判断（多轮尝试后）：在本机模型（Qwen2.5-1.5B）与所测任务上，SnapKV 式注意力打分选择未体现相对位置式的优势；散点驱逐整体不及"保留全 prompt 的 RSWA"（后者按构造等价完整注意力）。
 - 代码开关：`KVX_IMPORTANCE`/`KVX_BUDGET`/`KVX_WINDOW`/`KVX_OBS`/`KVX_HEADAGG`，默认关闭。
+
+## 20. FP8 KV 量化（SGLang + triton）——e4m3 近无损，e5m2 崩坏
+
+LongBench F1（n=20，temp=0，`kv_cache_dtype`）：
+
+| 子集 | bf16 | fp8_e4m3 | fp8_e5m2 |
+|---|---|---|---|
+| qasper | 0.3448 | 0.2858 | 0.0104 |
+| 2wikimqa | 0.1036 | 0.1264 | 0.0321 |
+| multifieldqa_en | 0.4326 | 0.3390 | 0.0784 |
+
+- **fp8_e4m3 近无损**（小幅波动，2wikimqa 甚至反超，属单次 n=20 噪声）；**fp8_e5m2 崩坏**（尾数位不足）。
+- 环境：vLLM 的 fp8 KV 走 FlashInfer（sm_120 不可用）；**SGLang + triton 后端可跑 fp8 KV**（本结果来源）。
+- 代码：`bench/sgl_longbench.py --kv-cache-dtype fp8_e4m3`。
