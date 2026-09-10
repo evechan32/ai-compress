@@ -129,3 +129,12 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
   `RuntimeError: FlashInfer backend is not available. Please install the package to enable FlashInfer kernels`
 - 原因：vLLM 0.28 的 fp8 KV 由 FlashInfer 后端实现，本机 FlashInfer 因 sm_120/CUDA 12.8 不可用。
 - 结论：本环境无法产出 FP8 KV 对照数据；详见 `environment.md §8.2`。
+
+## 12. SGLang 自定义 AttentionBackend 注册验证（通过，2026-09-10）
+
+- 注册 API：`sglang.srt.layers.attention.attention_registry.register_attention_backend(name)`（装饰器，注册工厂 `fn(runner) -> AttentionBackend`）。
+- 验证：定义 `kvx_triton`（继承 `TritonAttnBackend` 的恒等后端）并注册 →
+  - `registered has kvx_triton: True`
+  - `Engine(model_path=..., attention_backend="kvx_triton", mem_fraction_static=0.6, disable_cuda_graph=True)` → 10s 就绪，生成 `' Paris. The capital of France is...'`，EXITCODE=0
+- 结论：**SGLang 的 attention backend 扩展点在本机（sm_120, triton 后端）可用** —— 这是零 fork 之外实现 SnapKV/H2O 散点驱逐的可行路径。
+- 脚本：`/tmp/sgl_custom_backend.py`、`/tmp/sgl_custom_smoke.py`（服务器）。
