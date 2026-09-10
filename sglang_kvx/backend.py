@@ -51,22 +51,89 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_free = os.environ.get("KVX_FREE", "0") == "1"
         self._kvx_importance = os.environ.get("KVX_IMPORTANCE", "0") == "1"
         self._kvx_budget = int(os.environ.get("KVX_BUDGET", "256"))
+        self._kvx_obs = int(os.environ.get("KVX_OBS", "32"))
+        self._kvx_scores = None
+        self._kvx_sel = {}
         self._kvx_last_ptr = None
         self._kvx_freed = False
 
     def _importance_positions(self, rows, seq_len: int, budget: int, win: int):
         try:
-            v = self.token_to_kv_pool.v_buffer[0][rows]
-            score = v.float().norm(dim=-1).norm(dim=-1)
-            k = min(budget, seq_len)
-            top = torch.topk(score, k).indices.tolist()
-            keep = set(top)
-            start = max(0, seq_len - win)
-            keep.update(range(start, seq_len))
+            key = None
+            try:
+                key = int(self._kvx_cur_key)
+            except Exception:
+                key = None
+            cached = self._kvx_sel.get(key) if key is not None else None
+            if cached is None:
+                score = self._kvx_scores
+                if score is None or score.numel() == 0:
+                    raise ValueError("no attention scores captured")
+                t = min(score.numel(), seq_len)
+                k = min(budget, t)
+                cached = sorted(set(torch.topk(score[:t], k).indices.tolist()))
+                if key is not None:
+                    self._kvx_sel[key] = cached
+            keep = set(p for p in cached if p < seq_len)
+            keep.update(range(max(0, seq_len - win), seq_len))
             return sorted(keep)
         except Exception as e:
             print("KVX importance warn:", type(e).__name__, str(e)[:150], flush=True)
             return list(range(min(budget, seq_len))) + list(range(max(0, seq_len - win), seq_len))
+
+    def _kvx_maybe_score(self, q, k, layer, forward_batch):
+        if not self._kvx_importance or q is None:
+            return
+        try:
+            fm = forward_batch.forward_mode
+            if getattr(fm, "is_decode", None) and fm.is_decode():
+                return
+            if k is None:
+                kbuf, _ = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k = kbuf[forward_batch.out_cache_loc]
+                global _KVX_KFIX_LOGGED
+                if not globals().get("_KVX_KFIX_LOGGED"):
+                    globals()["_KVX_KFIX_LOGGED"] = True
+                    print("KVX score: k from pool path", flush=True)
+            lens = getattr(forward_batch, "extend_seq_lens", None)
+            if lens is not None and len(lens) > 1:
+                return
+            t = q.shape[0]
+            hq, hk, d = layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim
+            q3 = q.reshape(t, hq, d).float()
+            k3 = k.reshape(k.shape[0], hk, d).float()
+            w = min(self._kvx_obs, t)
+            rep = max(1, hq // hk)
+            imp = torch.zeros(t, device=q.device, dtype=torch.float32)
+            for h in range(hq):
+                kh = k3[:, h // rep, :]
+                s = (q3[t - w:t, h, :] @ kh.t()) / (d ** 0.5)
+                imp += torch.softmax(s, dim=-1).sum(dim=0)
+            self._kvx_scores = imp / max(1, hq)
+        except Exception as e:
+            print("KVX score warn:", type(e).__name__, str(e)[:150], flush=True)
+
+    def _kvx_discover(self, name, a, kw):
+        seen = globals().setdefault("_KVX_SEEN", set())
+        if name in seen:
+            return
+        seen.add(name)
+        k = kw.get("k", a[1] if len(a) > 1 else "?")
+        print(f"KVX discover: method={name} nargs={len(a)} k_is_none={k is None if not isinstance(k, str) else k}", flush=True)
+
+    def forward_extend(self, *args, **kwargs):
+        self._kvx_discover("forward_extend", args, kwargs)
+        if len(args) >= 5:
+            self._kvx_maybe_score(args[0], args[1], args[3], args[4])
+        return super().forward_extend(*args, **kwargs)
+
+    def _forward_extend_unified(self, *args, **kwargs):
+        self._kvx_discover("_forward_extend_unified", args, kwargs)
+        return super()._forward_extend_unified(*args, **kwargs)
+
+    def forward_mixed(self, *args, **kwargs):
+        self._kvx_discover("forward_mixed", args, kwargs)
+        return super().forward_mixed(*args, **kwargs)
 
     def init_forward_metadata(self, forward_batch):
         super().init_forward_metadata(forward_batch)
@@ -87,6 +154,10 @@ class ScatterTritonBackend(TritonAttnBackend):
                 s = int(seqlens[i])
                 start, end = old_indptr[i], old_indptr[i + 1]
                 rows = old_idx[start:end]
+                try:
+                    self._kvx_cur_key = int(forward_batch.req_pool_indices[i].item())
+                except Exception:
+                    self._kvx_cur_key = i
                 win = min(self._kvx_window, max(0, s - self._kvx_budget))
                 if self._kvx_importance:
                     sel = self._importance_positions(rows, s, self._kvx_budget, win)

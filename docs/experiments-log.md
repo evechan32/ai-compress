@@ -188,3 +188,20 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 
 - 结论：**V 范数不是有效的显著性代理**，劣于位置式。真 SnapKV 使用**最后一层注意力分数**；需在 prefill 阶段做一次打分（我们可在自有 `forward_extend` 用 q/k 现算最后一层分数）。
 - 代码：`KVX_IMPORTANCE=1`（+`KVX_BUDGET`/`KVX_WINDOW`），默认关闭。
+
+## 17. 真 SnapKV 信号（最后一层注意力分数）选择——仍劣于位置式（合成任务）
+
+实现：在 `forward_extend`（prefill）用该层 q/k 现算"末尾观察窗口(32) 对全部 prompt 位置"的注意力分数，聚合为重要性，选 top-B + 末尾窗口。
+
+| 选择策略（保留预算≈384） | 逐字一致率 | 平均相似度 |
+|---|---|---|
+| 完整注意力 | 1.0 | 1.0 |
+| 位置式 head256+win128 | 0.458 | 0.636 |
+| 注意力分数 top256+win128 | 0.125 | 0.335 |
+| V 范数 top256+win128 | 0.083 | 0.260 |
+| 位置式 head64+win32 | 0.042 | 0.282 |
+| 注意力分数 top64+win32 | 0.0 | 0.213 |
+
+- 结论：注意力分数优于 V 范数，但仍劣于位置式。原因：本合成任务的关键信息位于 prompt 中段，任何丢弃中段的散点策略都损失；位置式胜出靠"末尾窗口"命中 longqa/多轮所需信息。
+- 判断：**合成 needle 不利于 SnapKV**；要评估其真实价值需真实长文冗余任务（LongBench 等）。
+- 代码：`KVX_IMPORTANCE=1`（+`KVX_BUDGET`/`KVX_WINDOW`/`KVX_OBS`），默认关闭。
