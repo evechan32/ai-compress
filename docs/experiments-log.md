@@ -220,3 +220,17 @@ AI_COMPRESS_ENABLE=1 AI_COMPRESS_RSWA_WINDOW=256 python3 ...
 - 对照：vLLM RSWA 插件保留全 prompt → 按构造等价完整注意力（合成 24/24 逐字一致）。
 - 实现局限（影响重要性分数公平性）：单层分数、观察窗口 32、未处理 chunked prefill（分块时打分只覆盖最后 chunk）——官方 SnapKV 可能更好，但本次未能超越位置式。
 - 脚本：`bench/sgl_longbench.py`；数据 `/hy-tmp/longbench/data/`。
+
+## 19. 重要性实现改进后再测 LongBench——仍劣于位置式
+
+改进：多层分数聚合（替代仅末层）、观察窗口 32→64、per-head mean/max。LongBench 3 子集 F1（n=20）：
+
+| 子集 | 完整 | 位置 h256w128 | 重要性 末层obs32 | 重要性 多层mean obs64 | 重要性 多层max obs64 |
+|---|---|---|---|---|---|
+| qasper | 0.3448 | 0.2166 | 0.1159 | 0.0949 | 0.0874 |
+| 2wikimqa | 0.1036 | 0.1027 | 0.0635 | 0.0588 | 0.0493 |
+| multifieldqa_en | 0.4326 | 0.2657 | 0.1853 | 0.1504 | 0.1656 |
+
+- 结论：多层聚合与更大观察窗口**未改善**，重要性选择**始终显著劣于位置式**，二者均远低于完整注意力。
+- 综合判断（多轮尝试后）：在本机模型（Qwen2.5-1.5B）与所测任务上，SnapKV 式注意力打分选择未体现相对位置式的优势；散点驱逐整体不及"保留全 prompt 的 RSWA"（后者按构造等价完整注意力）。
+- 代码开关：`KVX_IMPORTANCE`/`KVX_BUDGET`/`KVX_WINDOW`/`KVX_OBS`/`KVX_HEADAGG`，默认关闭。

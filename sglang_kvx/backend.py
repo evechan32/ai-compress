@@ -51,8 +51,11 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_free = os.environ.get("KVX_FREE", "0") == "1"
         self._kvx_importance = os.environ.get("KVX_IMPORTANCE", "0") == "1"
         self._kvx_budget = int(os.environ.get("KVX_BUDGET", "256"))
-        self._kvx_obs = int(os.environ.get("KVX_OBS", "32"))
+        self._kvx_obs = int(os.environ.get("KVX_OBS", "64"))
+        self._kvx_headagg = os.environ.get("KVX_HEADAGG", "mean")
         self._kvx_scores = None
+        self._kvx_sum = None
+        self._kvx_cnt = 0
         self._kvx_sel = {}
         self._kvx_last_ptr = None
         self._kvx_freed = False
@@ -74,6 +77,9 @@ class ScatterTritonBackend(TritonAttnBackend):
                 cached = sorted(set(torch.topk(score[:t], k).indices.tolist()))
                 if key is not None:
                     self._kvx_sel[key] = cached
+                self._kvx_sum = None
+                self._kvx_cnt = 0
+                self._kvx_scores = None
             keep = set(p for p in cached if p < seq_len)
             keep.update(range(max(0, seq_len - win), seq_len))
             return sorted(keep)
@@ -104,12 +110,26 @@ class ScatterTritonBackend(TritonAttnBackend):
             k3 = k.reshape(k.shape[0], hk, d).float()
             w = min(self._kvx_obs, t)
             rep = max(1, hq // hk)
-            imp = torch.zeros(t, device=q.device, dtype=torch.float32)
-            for h in range(hq):
-                kh = k3[:, h // rep, :]
-                s = (q3[t - w:t, h, :] @ kh.t()) / (d ** 0.5)
-                imp += torch.softmax(s, dim=-1).sum(dim=0)
-            self._kvx_scores = imp / max(1, hq)
+            if self._kvx_headagg == "max":
+                imp = torch.zeros(t, device=q.device, dtype=torch.float32)
+                for h in range(hq):
+                    kh = k3[:, h // rep, :]
+                    sc = (q3[t - w:t, h, :] @ kh.t()) / (d ** 0.5)
+                    imp = torch.maximum(imp, torch.softmax(sc, dim=-1).sum(dim=0))
+            else:
+                imp = torch.zeros(t, device=q.device, dtype=torch.float32)
+                for h in range(hq):
+                    kh = k3[:, h // rep, :]
+                    sc = (q3[t - w:t, h, :] @ kh.t()) / (d ** 0.5)
+                    imp += torch.softmax(sc, dim=-1).sum(dim=0)
+                imp /= max(1, hq)
+            if self._kvx_sum is None or self._kvx_sum.numel() != t:
+                self._kvx_sum = imp
+                self._kvx_cnt = 1
+            else:
+                self._kvx_sum = self._kvx_sum + imp
+                self._kvx_cnt += 1
+            self._kvx_scores = self._kvx_sum / self._kvx_cnt
         except Exception as e:
             print("KVX score warn:", type(e).__name__, str(e)[:150], flush=True)
 
