@@ -53,12 +53,53 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_budget = int(os.environ.get("KVX_BUDGET", "256"))
         self._kvx_obs = int(os.environ.get("KVX_OBS", "64"))
         self._kvx_headagg = os.environ.get("KVX_HEADAGG", "mean")
+        self._kvx_mode = os.environ.get("KVX_MODE", "position")
+        self._kvx_page = int(os.environ.get("KVX_PAGE", "16"))
+        self._kvx_topk_pages = int(os.environ.get("KVX_TOPK_PAGES", "16"))
+        self._kvx_sink = int(os.environ.get("KVX_SINK", "64"))
+        self._kvx_last_q = None
         self._kvx_scores = None
         self._kvx_sum = None
         self._kvx_cnt = 0
         self._kvx_sel = {}
         self._kvx_last_ptr = None
         self._kvx_freed = False
+
+    def _quest_positions(self, rows, seq_len: int, win: int):
+        try:
+            kbuf, _ = self.token_to_kv_pool.get_kv_buffer(0)
+            kk = kbuf[rows].float()
+            hkv, d = kk.shape[1], kk.shape[2]
+            page = self._kvx_page
+            n_pages = (seq_len + page - 1) // page
+            pad = n_pages * page - seq_len
+            if pad:
+                kk = torch.cat([kk, kk[-1:].expand(pad, hkv, d)], dim=0)
+            kk = kk.reshape(n_pages, page, hkv, d)
+            kmax = kk.max(dim=1).values
+            kmin = kk.min(dim=1).values
+            q = self._kvx_last_q
+            if q is None:
+                raise ValueError("no query captured")
+            qf = q.float()
+            rep = max(1, qf.shape[0] // hkv)
+            score = torch.zeros(n_pages, device=kk.device)
+            for h in range(qf.shape[0]):
+                kh_max = kmax[:, h // rep, :]
+                kh_min = kmin[:, h // rep, :]
+                up = torch.maximum(qf[h] * kh_max, qf[h] * kh_min).sum(dim=-1)
+                score += up
+            k = min(self._kvx_topk_pages, n_pages)
+            top_pages = torch.topk(score, k).indices.tolist()
+            keep = set(range(min(self._kvx_sink, seq_len)))
+            for pg in top_pages:
+                keep.update(range(pg * page, min((pg + 1) * page, seq_len)))
+            keep.update(range(max(0, seq_len - win), seq_len))
+            return sorted(keep)
+        except Exception as e:
+            print("KVX quest warn:", type(e).__name__, str(e)[:150], flush=True)
+            return list(range(min(self._kvx_topk_pages * self._kvx_page, seq_len))) + \
+                list(range(max(0, seq_len - win), seq_len))
 
     def _importance_positions(self, rows, seq_len: int, budget: int, win: int):
         try:
@@ -145,11 +186,25 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_discover("forward_extend", args, kwargs)
         if len(args) >= 5:
             self._kvx_maybe_score(args[0], args[1], args[3], args[4])
+            self._kvx_capture_q(args[0], args[3])
         return super().forward_extend(*args, **kwargs)
 
     def _forward_extend_unified(self, *args, **kwargs):
         self._kvx_discover("_forward_extend_unified", args, kwargs)
         return super()._forward_extend_unified(*args, **kwargs)
+
+    def _kvx_capture_q(self, q, layer):
+        try:
+            if self._kvx_mode == "quest" and getattr(layer, "layer_id", -1) == 0 \
+                    and q is not None:
+                hq, d = layer.tp_q_head_num, layer.qk_head_dim
+                self._kvx_last_q = q.reshape(-1, hq, d)[-1].detach()
+        except Exception:
+            pass
+
+    def forward_decode(self, q, k, v, layer, forward_batch, *args, **kwargs):
+        self._kvx_capture_q(q, layer)
+        return super().forward_decode(q, k, v, layer, forward_batch, *args, **kwargs)
 
     def forward_mixed(self, *args, **kwargs):
         self._kvx_discover("forward_mixed", args, kwargs)
@@ -179,7 +234,10 @@ class ScatterTritonBackend(TritonAttnBackend):
                 except Exception:
                     self._kvx_cur_key = i
                 win = min(self._kvx_window, max(0, s - self._kvx_budget))
-                if self._kvx_importance:
+                if self._kvx_mode == "quest":
+                    sel = self._quest_positions(rows, s, self._kvx_window)
+                    keep = rows[torch.tensor(sel, device=rows.device)]
+                elif self._kvx_importance:
                     sel = self._importance_positions(rows, s, self._kvx_budget, win)
                     keep = rows[torch.tensor(sel, device=rows.device)]
                 else:

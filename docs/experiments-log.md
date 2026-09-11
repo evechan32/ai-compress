@@ -248,3 +248,27 @@ LongBench F1（n=20，temp=0，`kv_cache_dtype`）：
 - **fp8_e4m3 近无损**（小幅波动，2wikimqa 甚至反超，属单次 n=20 噪声）；**fp8_e5m2 崩坏**（尾数位不足）。
 - 环境：vLLM 的 fp8 KV 走 FlashInfer（sm_120 不可用）；**SGLang + triton 后端可跑 fp8 KV**（本结果来源）。
 - 代码：`bench/sgl_longbench.py --kv-cache-dtype fp8_e4m3`。
+
+## 21. Quest 式页稀疏移植（SGLang kvx_scatter）——质量≈位置式，无算力收益
+
+实现：prefill 记录 query；decode 时从 KV 池读 K，按页(`KVX_PAGE`=16)算 min/max，用最近 query 估计页上界选 top-k 页 + 窗口 + sink（层无关近似）。
+
+质量（LongBench F1，n=20，保留≈384）：
+
+| 子集 | 完整 | 位置 h256w128 | **Quest(页16 topk16 win128 sink64)** | 注意力分数 | V范数 |
+|---|---|---|---|---|---|
+| qasper | 0.3448 | 0.2166 | **0.2229** | 0.1159 | — |
+| 2wikimqa | 0.1036 | 0.1027 | **0.0963** | 0.0635 | — |
+| multifieldqa_en | 0.4326 | 0.2657 | **0.2557** | 0.1853 | — |
+
+算力（prompt 4000 token，生成 256，SGLang triton）：
+
+| 配置 | decode tok/s |
+|---|---|
+| 完整注意力 | **153.9** |
+| 位置散点 | 146.6 |
+| Quest 移植 | 140.3 |
+
+- 质量：Quest ≈ 位置式（最好的散点基线），优于注意力分数/V范数；均远低于完整注意力。
+- 算力：**反而更慢**——我们每步 Python 重建索引 + 每步从 KV 池重算页 min/max（O(s) 读取），恰好抵消并超过省下的读取。忠实 Quest 需 prefill 一次性算好页元数据 + 选择融进 kernel（零 fork 做不到）。
+- 代码：`KVX_MODE=quest`（+`KVX_PAGE`/`KVX_TOPK_PAGES`/`KVX_SINK`/`KVX_WINDOW`），默认关闭。
