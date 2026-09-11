@@ -77,4 +77,5 @@ docs/            调研报告、设计文档、实现计划、spike 结论、实
 - `docs/FINAL-REPORT.md` — **项目总报告（全部实验结论与数据汇总）**
 - `docs/fp8-kv-report.md` — FP8 KV 量化完整对比
 - `docs/survey-query-sparse.md` — Query 块稀疏（Quest/InfLLM/MagicPIG/PQCache）调研
+- `docs/attention-heatmap.md` — **注意力分布热力图（1024 token）**
 - `docs/environment.md` — 服务器环境与重建档案
