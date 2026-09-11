@@ -1,0 +1,83 @@
+{
+  "model": "SmolLM2-1.7B-Instruct",
+  "path": "/hy-tmp/models/SmolLM2-1.7B-Instruct",
+  "length": 8192,
+  "needle_pos": [
+    4088,
+    4089,
+    4090,
+    4091,
+    4092,
+    4093,
+    4094,
+    4095,
+    4096,
+    4097,
+    4098,
+    4099,
+    4100,
+    4101,
+    4102,
+    4103,
+    4104
+  ],
+  "sink": 64,
+  "window": 256,
+  "coverage": {
+    "last_layer": {
+      "sink": 0.39685559272766113,
+      "window": 0.4341643750667572,
+      "middle": 0.16898006200790405,
+      "top10pct": 0.9122592806816101,
+      "needle_mass": 0.006100886967033148,
+      "needle_rank": 10
+    },
+    "mean_over_layers": {
+      "sink": 0.5678285360336304,
+      "window": 0.25716546177864075,
+      "middle": 0.17500607669353485,
+      "top10pct": 0.8941501379013062,
+      "needle_mass": 0.005160484928637743,
+      "needle_rank": 19
+    }
+  },
+  "kv": {
+    "n_layers": 24,
+    "n_heads": 32,
+    "n_kv_heads": 32,
+    "head_dim": 64,
+    "elem_size": 2,
+    "per_layer_bytes": [
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864,
+      67108864
+    ],
+    "total_bytes": 1610612736,
+    "per_kv_head_bytes": 2097152,
+    "gqa_group": 1,
+    "measured": false
+  },
+  "usage_npy": "/root/attn_sweep/SmolLM2-1.7B-Instruct/L8192/usage.npy",
+  "outdir": "/root/attn_sweep/SmolLM2-1.7B-Instruct/L8192"
+}

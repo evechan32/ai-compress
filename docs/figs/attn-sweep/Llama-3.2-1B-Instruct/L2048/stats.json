@@ -1,0 +1,72 @@
+{
+  "model": "Llama-3.2-1B-Instruct",
+  "path": "/hy-tmp/models/Llama-3.2-1B-Instruct",
+  "length": 2048,
+  "needle_pos": [
+    1017,
+    1018,
+    1019,
+    1020,
+    1021,
+    1022,
+    1023,
+    1024,
+    1025,
+    1026,
+    1027,
+    1028,
+    1029,
+    1030
+  ],
+  "sink": 64,
+  "window": 256,
+  "coverage": {
+    "last_layer": {
+      "sink": 0.5120673179626465,
+      "window": 0.26104873418807983,
+      "middle": 0.22688394784927368,
+      "top10pct": 0.8294768333435059,
+      "needle_mass": 0.023060547187924385,
+      "needle_rank": 4
+    },
+    "mean_over_layers": {
+      "sink": 0.5146034955978394,
+      "window": 0.27563729882240295,
+      "middle": 0.2097592055797577,
+      "top10pct": 0.8214704990386963,
+      "needle_mass": 0.02817421965301037,
+      "needle_rank": 7
+    }
+  },
+  "kv": {
+    "n_layers": 16,
+    "n_heads": 32,
+    "n_kv_heads": 8,
+    "head_dim": 64,
+    "elem_size": 2,
+    "per_layer_bytes": [
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304,
+      4194304
+    ],
+    "total_bytes": 67108864,
+    "per_kv_head_bytes": 524288,
+    "gqa_group": 4,
+    "measured": false
+  },
+  "usage_npy": "/root/attn_sweep/Llama-3.2-1B-Instruct/L2048/usage.npy",
+  "outdir": "/root/attn_sweep/Llama-3.2-1B-Instruct/L2048"
+}
