@@ -86,6 +86,7 @@ def main() -> None:
     ap.add_argument("--dtype", default="bfloat16", help="量化模型用 auto")
     ap.add_argument("--max-output-tokens", type=int, default=60)
     ap.add_argument("--max-model-len", type=int, default=16384)
+    ap.add_argument("--kv-cache-dtype", default="auto", help="如 fp8（原生 KV 量化对照）")
     ap.add_argument("--prefix-caching", action="store_true",
                     help="启用 vLLM prefix caching（默认关闭以对齐早期评测）")
     args = ap.parse_args()
@@ -99,6 +100,7 @@ def main() -> None:
     t_engine = time.time()
     llm = LLM(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len,
               gpu_memory_utilization=0.85, enforce_eager=True,
+              kv_cache_dtype=args.kv_cache_dtype,
               enable_prefix_caching=args.prefix_caching)
     engine_load_s = round(time.time() - t_engine, 2)
     sampling = SamplingParams(max_tokens=args.max_output_tokens, temperature=0.0)
