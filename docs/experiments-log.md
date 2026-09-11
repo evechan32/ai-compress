@@ -272,3 +272,12 @@ LongBench F1（n=20，temp=0，`kv_cache_dtype`）：
 - 质量：Quest ≈ 位置式（最好的散点基线），优于注意力分数/V范数；均远低于完整注意力。
 - 算力：**反而更慢**——我们每步 Python 重建索引 + 每步从 KV 池重算页 min/max（O(s) 读取），恰好抵消并超过省下的读取。忠实 Quest 需 prefill 一次性算好页元数据 + 选择融进 kernel（零 fork 做不到）。
 - 代码：`KVX_MODE=quest`（+`KVX_PAGE`/`KVX_TOPK_PAGES`/`KVX_SINK`/`KVX_WINDOW`），默认关闭。
+
+## 22. SGLang HiCache 真·无损 offload（逐字无损确认；未扩大可寻址上下文）
+
+- 逐字无损：同 prompt（`The capital of France is`）开/关 HiCache 输出**完全相同**（`' Paris. The capital of France is also the capital of which country?\nA)'`）；加载 12.8s → 20.2s（HiCache 初始化开销）。
+- 容量实验（小 GPU KV 池 mem_fraction_static=0.30 + 20k token 输入）：
+  - HC 关：`ValueError: Input length (17778 tokens) exceeds the maximum allowed length (11052 tokens)`
+  - HC 开：**同样报错**（上限仍为 GPU 池决定的 11052）
+- 结论：本版 SGLang 的 HiCache 是**分层前缀缓存**（GPU/宿主/存储多层复用，逐字无损），**不会提升 max_total_num_tokens / 扩展可服务上下文**。要在 GPU 受限下扩展容量，需 vLLM KV connector 或 InfiniGen 式预取等别的机制。
+- 复用收益未在本实验展开（需"前缀长/请求多到 GPU 前缀缓存被挤出"的负载才能体现）。
