@@ -40,7 +40,26 @@
 - **GQA 是最大的"免费压缩"** → 若目标是显存，换 GQA 模型比推理期压缩更彻底；若目标是研究推理期压缩，**MHA 大 KV 模型（如 SmolLM2）才是最有价值的试验台**。
 - **needle 低 rank** → 选择信号要基于"模型如何使用"（检索头/重建/期望注意力），而非注意力质量本身；这与 `survey-latest-2026.md` 里 CompressKV(检索头+层预算)、KVzip(重建) 的动机一致。
 
-## 3. 复现
+## 3. 层间可压缩性（per-layer）
+
+方法：`bench/attn_layer_analysis.py` 读取每组 `attn.npz` 的逐层 `colsum`，归一化为该层"KV 使用分布"，再算 top10% 覆盖与 middle 占比（数据：`analysis/layer_concentration.json`）。
+
+| 模型（L=8192） | 层数 | top10 均值 | top10 最小（最难压） | top10 最大（最易压） | middle 均值 |
+|---|---|---|---|---|---|
+| Llama-3.2-1B | 16 | 0.627 | 0.38（L0） | 0.78（L3） | 0.484 |
+| SmolLM2-1.7B | 24 | 0.701 | 0.23（L0） | 0.88（L4） | 0.403 |
+| Qwen2.5-1.5B | 28 | 0.532 | 0.16（L0） | 0.77（L25） | 0.630 |
+
+发现：
+
+1. **层间极度不均匀**：同一模型内 top10 覆盖从 0.16 到 0.88（相差 5×）。→ **统一逐层预算浪费巨大**，支持 CompressKV 式 per-layer 预算。
+2. **第 0 层（常连同第 1 层）普遍最难压**：Qwen L0 top10=0.16 / middle=0.96、SmolLM2 L0 0.23/0.96、Llama L0 0.38/0.80——**早期层把注意力摊在全上下文**（broad mixing），几乎不可驱逐。
+3. **最容易压的层因模型而异**：Llama L1–L3、SmolLM2 L2–L5（早中段），而 **Qwen 的 L24–L26（末段）** 最集中。→ "哪些层可压"是**模型相关**，必须逐模型校准。
+4. middle 均值随 L 上升（与 §1 整体结论一致）。
+
+**对压缩的落点**：层间预算应是"**梯度**"而非"一刀切"；这与我们 RSWA 的模型级全局窗口冲突（零 fork 下 vLLM mask 不支持逐层），要落地需自定义 attention backend（SGLang 路径）。
+
+## 4. 复现
 
 ```bash
 # 服务器；输出写到 /root 避免 /hy-tmp 压力
@@ -53,14 +72,15 @@
 
 说明：`attention_matrix` 用 query-chunked 实现，`attn.npz` 只对 `L ≤ --max-full` 存完整 `[H,Lq,Lk]`；`usage.npy` 是每个 KV 位置收到的注意力质量（列和）。
 
-## 4. 产出图（`docs/figs/attn-sweep/`）
+## 5. 产出图（`docs/figs/attn-sweep/`）
 
 - `aggregate_coverage.png` — sink/window/middle/top10%/needle 占比 vs 长度（3 模型）
 - `kv_bytes_vs_length.png`、`kv_per_layer.png`、`kv_usage_distribution.png`
 - `<model>/L<n>/attn_positions.png`（逐层 attention vs 位置）、`attn_cumulative.png`（累积覆盖）
 - `<model>/L1024/attn_heads_L*.png`（头 × 位置热力图）
+- `analysis/layer_top10_vs_depth.png`、`analysis/layer_mid_vs_depth.png`、`analysis/layer_usage_heatmap.png`、`analysis/layer_concentration.json`（层间可压缩性）
 
-## 5. 局限
+## 6. 局限
 
 - 每 (模型, L) **仅 1 个样本**、needle 固定在 50%、单次前向取最后 query 行；非统计结论。
 - 只取最后 query 行 + 全序列列和，**不等价于自回归生成时的逐步分布**。
