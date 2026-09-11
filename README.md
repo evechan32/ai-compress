@@ -73,5 +73,8 @@ docs/            调研报告、设计文档、实现计划、spike 结论、实
 - `docs/superpowers/plans/2026-09-08-kv-eviction-plugin.md` — 实现计划
 - `docs/spike-r1-findings.md` — R1 可行性 spike 结论
 - `docs/bench-report-2026-09-08.md` — 基准评测报告
-- `docs/experiments-log.md` — **全部开发/测试数据总账**
+- `docs/experiments-log.md` — **全部开发/测试数据总账（§1–§22）**
+- `docs/FINAL-REPORT.md` — **项目总报告（全部实验结论与数据汇总）**
+- `docs/fp8-kv-report.md` — FP8 KV 量化完整对比
+- `docs/survey-query-sparse.md` — Query 块稀疏（Quest/InfLLM/MagicPIG/PQCache）调研
 - `docs/environment.md` — 服务器环境与重建档案
