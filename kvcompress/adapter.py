@@ -48,12 +48,63 @@ def install(cfg: CompressConfig) -> None:
     _target_archs = frozenset(cfg.target_archs)
     _window = cfg.rswa_window
     _patch_rswa_window_property()
+    _patch_backend_guard()
     for arch in cfg.target_archs:
         _patch_attention_factory(_ARCH_TO_MODULE[arch])
     logger.info(
         "kvcompress: RSWA 注入生效 archs=%s window=%d",
         sorted(_target_archs), _window,
     )
+
+
+_RSWA_OK_BACKENDS = frozenset({"TritonAttentionBackend", "FlexAttentionBackend"})
+
+
+def _backend_supports_rswa(cls) -> bool:
+    """RSWA 掩码仅在实现了它的 backend 生效；FA<4 会静默忽略掩码。"""
+    if cls.__name__ in _RSWA_OK_BACKENDS:
+        return True
+    if "flash_attn" in getattr(cls, "__module__", ""):
+        try:
+            from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+            return (get_flash_attn_version() or 0) >= 4
+        except Exception:
+            return False
+    return False
+
+
+def _patch_backend_guard() -> None:
+    """拒绝"掩码被忽略但仍释放 KV 块"的 backend（会读已释放显存）。"""
+    import importlib
+    import os
+
+    mod = importlib.import_module("vllm.model_executor.layers.attention.attention")
+    if getattr(mod, "_kvcompress_guard", False):
+        return
+    orig = mod.get_attn_backend
+
+    def guarded(*args, **kwargs):
+        cls = orig(*args, **kwargs)
+        if _backend_supports_rswa(cls):
+            return cls
+        if os.environ.get("AI_COMPRESS_FORCE_BACKEND", "0") == "1":
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+            logger.warning(
+                "kvcompress: %s 不支持 RSWA 掩码，已替换为 "
+                "TritonAttentionBackend（AI_COMPRESS_FORCE_BACKEND=1）",
+                cls.__name__,
+            )
+            return TritonAttentionBackend
+        raise RuntimeError(
+            f"kvcompress RSWA 需要支持 RSWA 掩码的 attention backend，但选中了 "
+            f"{cls.__name__}：它不会应用掩码，却仍会释放 KV 块，导致注意力读取"
+            f"已释放/复用的显存（静默错误 + 数据损坏）。"
+            f"请加 --attention-backend TRITON_ATTN，"
+            f"或设 AI_COMPRESS_FORCE_BACKEND=1 由插件自动替换。"
+        )
+
+    mod.get_attn_backend = guarded
+    mod._kvcompress_guard = True
 
 
 def _patch_attention_factory(module_name: str) -> None:
