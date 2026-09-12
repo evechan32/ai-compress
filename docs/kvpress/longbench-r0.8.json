@@ -1,0 +1,96 @@
+{
+  "tag": "r0.8",
+  "model": "/models/qwen2.5-1.5b-instruct",
+  "ratio": 0.8,
+  "n": 20,
+  "files": [
+    "qasper.jsonl",
+    "2wikimqa.jsonl",
+    "multifieldqa_en.jsonl",
+    "hotpotqa.jsonl",
+    "triviaqa.jsonl"
+  ],
+  "results": {
+    "snapkv": {
+      "per_file": {
+        "qasper.jsonl": 0.3101,
+        "2wikimqa.jsonl": 0.1985,
+        "multifieldqa_en.jsonl": 0.3847,
+        "hotpotqa.jsonl": 0.3087,
+        "triviaqa.jsonl": 0.1787
+      },
+      "mean": 0.2761
+    },
+    "chunkkv": {
+      "per_file": {
+        "qasper.jsonl": 0.2724,
+        "2wikimqa.jsonl": 0.2152,
+        "multifieldqa_en.jsonl": 0.4064,
+        "hotpotqa.jsonl": 0.2955,
+        "triviaqa.jsonl": 0.1829
+      },
+      "mean": 0.2745
+    },
+    "expected": {
+      "per_file": {
+        "qasper.jsonl": 0.3358,
+        "2wikimqa.jsonl": 0.1538,
+        "multifieldqa_en.jsonl": 0.3047,
+        "hotpotqa.jsonl": 0.2598,
+        "triviaqa.jsonl": 0.165
+      },
+      "mean": 0.2438
+    },
+    "keydiff": {
+      "per_file": {
+        "qasper.jsonl": 0.2666,
+        "2wikimqa.jsonl": 0.153,
+        "multifieldqa_en.jsonl": 0.2923,
+        "hotpotqa.jsonl": 0.16,
+        "triviaqa.jsonl": 0.1693
+      },
+      "mean": 0.2082
+    },
+    "tova": {
+      "per_file": {
+        "qasper.jsonl": 0.2468,
+        "2wikimqa.jsonl": 0.1735,
+        "multifieldqa_en.jsonl": 0.3618,
+        "hotpotqa.jsonl": 0.3087,
+        "triviaqa.jsonl": 0.1758
+      },
+      "mean": 0.2533
+    },
+    "pyramidkv": {
+      "per_file": {
+        "qasper.jsonl": 0.2961,
+        "2wikimqa.jsonl": 0.1985,
+        "multifieldqa_en.jsonl": 0.3884,
+        "hotpotqa.jsonl": 0.3087,
+        "triviaqa.jsonl": 0.1799
+      },
+      "mean": 0.2743
+    },
+    "streamingllm": {
+      "per_file": {
+        "qasper.jsonl": 0.2789,
+        "2wikimqa.jsonl": 0.2167,
+        "multifieldqa_en.jsonl": 0.2478,
+        "hotpotqa.jsonl": 0.2302,
+        "triviaqa.jsonl": 0.2131
+      },
+      "mean": 0.2373
+    },
+    "kvzip": {
+      "per_file": {
+        "qasper.jsonl": 0.3451,
+        "2wikimqa.jsonl": 0.1968,
+        "multifieldqa_en.jsonl": 0.3915,
+        "hotpotqa.jsonl": 0.3177,
+        "triviaqa.jsonl": 0.1898
+      },
+      "mean": 0.2882
+    }
+  },
+  "wall_s": 367.1
+}
