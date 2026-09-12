@@ -68,3 +68,39 @@ PYTHONPATH=/root/kvpress-libs /usr/local/bin/python3 bench/kvpress_eval.py \
 ## 5. 隔离安装说明
 
 kvpress 0.5.4 依赖 `transformers<5.3`，直接装会降级系统 5.16.1 → 采用 `pip install --no-deps --target=/root/kvpress-libs transformers==5.2.0 tokenizers==0.22.2 kvpress accelerate datasets pyarrow pandas dill xxhash multiprocess fire termcolor cachetools`，运行时 `PYTHONPATH=/root/kvpress-libs` 遮蔽，torch 复用系统。已验证系统 `transformers` 仍为 5.16.1。
+
+## 6. 附：kvpress 全库广扫（ratio 0.5 / 0.8，5 任务 × n=20）
+
+Baseline `none = 0.2882`。0.5 与 0.8 两次广扫合并（原始 JSON 见本机 `server-export/kvpress-out/`）：
+
+| method | mean@0.5 | Δ0.5 | mean@0.8 | Δ0.8 |
+|---|---|---|---|---|
+| compactor | 0.2918 | **+0.0036** | 0.2474 | −0.0408 |
+| chunkkv | 0.2886 | +0.0004 | 0.2745 | −0.0137 |
+| tova | 0.2872 | −0.0010 | 0.2533 | −0.0349 |
+| cur | 0.2857 | −0.0025 | 0.2456 | −0.0426 |
+| leverage | 0.2833 | −0.0049 | 0.2498 | −0.0384 |
+| block | 0.2793 | −0.0089 | 0.2199 | −0.0683 |
+| ada（头级预算） | 0.2750 | −0.0132 | 0.2674 | −0.0208 |
+| lagkv | 0.2744 | −0.0138 | 0.2372 | −0.0510 |
+| merging | 0.2718 | −0.0164 | 0.2714 | −0.0168 |
+| snapkv | 0.2713 | −0.0169 | 0.2761 | **−0.0121** |
+| keydiff | 0.2705 | −0.0177 | 0.2082 | −0.0800 |
+| think（通道） | 0.2671 | −0.0211 | 0.1165 | −0.1717 |
+| expected | 0.2630 | −0.0252 | 0.2438 | −0.0444 |
+| pyramidkv | 0.2557 | −0.0325 | 0.2743 | −0.0139 |
+| cap | 0.2475 | −0.0407 | 0.2203 | −0.0679 |
+| knorm | 0.2341 | −0.0541 | 0.1120 | −0.1762 |
+| streamingllm | 0.2321 | −0.0561 | 0.2373 | −0.0509 |
+| chunk | 0.1812 | −0.1070 | 0.1141 | −0.1741 |
+
+结论：
+
+1. **`chunkkv` 最稳**：50% 近无损（+0.0004）、80% 仍居第一梯队（−0.014）。
+2. **`snapkv` / `pyramidkv` 在 80% 更稳**（−0.012 / −0.014）——"观察窗口 + 位置"组合抗激进压缩。
+3. **`ada`（头级预算）在 80% 明显优于 50%**（−0.021 vs −0.013）→ 头级重分配在极端预算下更重要。
+4. **`compactor` / `cur` / `leverage` 只适合温和预算**（50% ≈/优于 baseline，80% 掉 ~0.04）。
+5. **通道/范数类在激进预算崩**：`think` −0.17、`knorm` −0.18、`chunk` −0.17。
+6. 环境失败（非算法结论）：`observed`（需 eager）、`kvzap`/`finch`/`duo`/`critical`/`dms`（需额外资产）、`qfilter`（需 HF 下载）。
+
+> `kvzip` 不在此表（手动协议无效，见 §0/§0.1）。
