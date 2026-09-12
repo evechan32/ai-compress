@@ -26,7 +26,6 @@ from bench.sgl_longbench import TEMPLATE, _f1  # noqa: E402
 PRESS_FACTORY = {
     "none": None,
     "snapkv": "SnapKVPress",
-    "chunkkv": "ChunkKVPress",
     "expected": "ExpectedAttentionPress",
     "keydiff": "KeyDiffPress",
     "tova": "TOVAPress",
@@ -36,6 +35,27 @@ PRESS_FACTORY = {
     "knorm": "KnormPress",
     "observed": "ObservedAttentionPress",
     "leverage": "LeverageScorePress",
+    "lagkv": "LagKVPress",
+    "qfilter": "QFilterPress",
+    "cur": "CURPress",
+    "kvzap": "KVzapPress",
+    "non_causal": "NonCausalAttnPress",
+    "random": "RandomPress",
+    "compactor": "CompactorPress",
+    "finch": "FinchPress",
+    "cap": "CapPress",
+}
+
+_SNAP_WRAPPERS = {
+    "chunkkv": "ChunkKVPress",
+    "chunk": "ChunkPress",
+    "ada": "AdaKVPress",
+    "critical": "CriticalKVPress",
+    "critical_ada": "CriticalAdaKVPress",
+    "block": "BlockPress",
+    "dms": "DMSPress",
+    "merging": "MergingPress",
+    "lukv": "LUKVPress",
 }
 
 
@@ -44,8 +64,13 @@ def build_press(name: str, ratio: float):
         return None
     import kvpress
 
-    if name == "chunkkv":
-        return kvpress.ChunkKVPress(press=kvpress.SnapKVPress(compression_ratio=ratio))
+    if name in _SNAP_WRAPPERS:
+        cls = getattr(kvpress, _SNAP_WRAPPERS[name])
+        return cls(press=kvpress.SnapKVPress(compression_ratio=ratio))
+    if name == "think":
+        return kvpress.ThinKPress(key_channel_compression_ratio=ratio)
+    if name == "duo":
+        return kvpress.DuoAttentionPress(head_compression_ratio=ratio)
     cls = getattr(kvpress, PRESS_FACTORY[name])
     try:
         return cls(compression_ratio=ratio)
@@ -93,6 +118,15 @@ def main() -> None:
 
     results = {}
     t0 = time.time()
+    path = os.path.join(args.out, f"kvpress-{args.tag}.json")
+
+    def save() -> None:
+        payload = {"tag": args.tag, "model": args.model, "ratio": args.ratio,
+                   "n": args.n, "files": args.files, "results": results,
+                   "wall_s": round(time.time() - t0, 1)}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
     for method in args.methods:
         try:
             press = build_press(method, args.ratio)
@@ -127,14 +161,9 @@ def main() -> None:
         mean = round(sum(per_file.values()) / max(1, len(per_file)), 4)
         results[method] = {"per_file": per_file, "mean": mean}
         print(f"== {method:<12} mean_f1={mean}", flush=True)
+        save()
 
-    payload = {
-        "tag": args.tag, "model": args.model, "ratio": args.ratio, "n": args.n,
-        "files": args.files, "results": results, "wall_s": round(time.time() - t0, 1),
-    }
-    path = os.path.join(args.out, f"kvpress-{args.tag}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    save()
     print(f"WROTE {path}", flush=True)
 
 
