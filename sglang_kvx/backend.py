@@ -49,11 +49,13 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_head = int(os.environ.get("KVX_HEAD", "64"))
         self._kvx_window = int(os.environ.get("KVX_WINDOW", "32"))
         self._kvx_free = os.environ.get("KVX_FREE", "0") == "1"
-        self._kvx_importance = os.environ.get("KVX_IMPORTANCE", "0") == "1"
+        self._kvx_mode = os.environ.get("KVX_MODE", "position")
+        self._kvx_importance = (os.environ.get("KVX_IMPORTANCE", "0") == "1"
+                                or self._kvx_mode == "chunk")
         self._kvx_budget = int(os.environ.get("KVX_BUDGET", "256"))
         self._kvx_obs = int(os.environ.get("KVX_OBS", "64"))
         self._kvx_headagg = os.environ.get("KVX_HEADAGG", "mean")
-        self._kvx_mode = os.environ.get("KVX_MODE", "position")
+        self._kvx_chunk = int(os.environ.get("KVX_CHUNK", "20"))
         self._kvx_page = int(os.environ.get("KVX_PAGE", "16"))
         self._kvx_topk_pages = int(os.environ.get("KVX_TOPK_PAGES", "16"))
         self._kvx_sink = int(os.environ.get("KVX_SINK", "64"))
@@ -126,6 +128,46 @@ class ScatterTritonBackend(TritonAttnBackend):
             return sorted(keep)
         except Exception as e:
             print("KVX importance warn:", type(e).__name__, str(e)[:150], flush=True)
+            return list(range(min(budget, seq_len))) + list(range(max(0, seq_len - win), seq_len))
+
+    def _chunk_positions(self, rows, seq_len: int, budget: int, win: int):
+        try:
+            key = None
+            try:
+                key = int(self._kvx_cur_key)
+            except Exception:
+                key = None
+            cached = self._kvx_sel.get(key) if key is not None else None
+            if cached is None:
+                score = self._kvx_scores
+                if score is None or score.numel() == 0:
+                    raise ValueError("no attention scores captured")
+                t = min(score.numel(), seq_len)
+                clen = max(1, self._kvx_chunk)
+                n_chunks = (t + clen - 1) // clen
+                s = score[:t].float()
+                pad = n_chunks * clen - t
+                if pad:
+                    s = torch.cat([s, s.new_zeros(pad)])
+                chunk_score = s.reshape(n_chunks, clen).sum(dim=1)
+                order = torch.argsort(chunk_score, descending=True).tolist()
+                keep = set()
+                for c in order:
+                    a = c * clen
+                    keep.update(range(a, min(a + clen, t)))
+                    if len(keep) >= budget:
+                        break
+                cached = sorted(keep)
+                if key is not None:
+                    self._kvx_sel[key] = cached
+                self._kvx_sum = None
+                self._kvx_cnt = 0
+                self._kvx_scores = None
+            keep = set(p for p in cached if p < seq_len)
+            keep.update(range(max(0, seq_len - win), seq_len))
+            return sorted(keep)
+        except Exception as e:
+            print("KVX chunk warn:", type(e).__name__, str(e)[:150], flush=True)
             return list(range(min(budget, seq_len))) + list(range(max(0, seq_len - win), seq_len))
 
     def _kvx_maybe_score(self, q, k, layer, forward_batch):
@@ -236,6 +278,9 @@ class ScatterTritonBackend(TritonAttnBackend):
                 win = min(self._kvx_window, max(0, s - self._kvx_budget))
                 if self._kvx_mode == "quest":
                     sel = self._quest_positions(rows, s, self._kvx_window)
+                    keep = rows[torch.tensor(sel, device=rows.device)]
+                elif self._kvx_mode == "chunk":
+                    sel = self._chunk_positions(rows, s, self._kvx_budget, win)
                     keep = rows[torch.tensor(sel, device=rows.device)]
                 elif self._kvx_importance:
                     sel = self._importance_positions(rows, s, self._kvx_budget, win)

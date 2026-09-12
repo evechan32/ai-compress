@@ -8,6 +8,17 @@ SGLang decode 通过扁平 `kv_indices` + `kv_indptr` gather KV（page_size=1 �
 本 backend 在 decode 元数据构建后，把每个请求的 KV 索引过滤为 `[头 head 段 + 末尾 window 段]`，
 丢弃中段 → decode 只对被保留的分散位置做注意力。
 
+## 选择模式（KVX_MODE）
+
+| KVX_MODE | 选择信号 | 关键参数 |
+|---|---|---|
+| `position`（默认） | 位置 | `KVX_HEAD` / `KVX_WINDOW` |
+| `quest` | 当前 query 的页级 min/max 上界 | `KVX_PAGE` / `KVX_TOPK_PAGES` |
+| `importance` | prefill 观察窗注意力的 token 级 top-k | `KVX_BUDGET` / `KVX_OBS` / `KVX_HEADAGG` |
+| **`chunk`** | **观察窗注意力 → 块级聚合（ChunkKV 式）** | `KVX_BUDGET` / `KVX_OBS` / **`KVX_CHUNK`** |
+
+`chunk` 复用 `importance` 的 prefill 打分（最后 `KVX_OBS` 个 query 对全序列的注意力），但选择粒度是**块**：把 token 分数按 `KVX_CHUNK`（默认 20）分组求和 → 取 top 块直到累计 token 数达到 `KVX_BUDGET`，再并上 sink + 末尾 window。对应 ChunkKV（arXiv 2502.00299）的核心思想——**块级驱逐保持语义连续**，避免 token 级剪枝切断语义单元。
+
 ## 运行（服务器）
 
 ```bash
@@ -34,7 +45,7 @@ e.generate("...", {"max_new_tokens": 16, "temperature": 0})
 ## 当前限制 / 二期
 
 1. 仅限制注意力可见范围，**未释放 KV 池槽位**（显存未回收）。
-2. 选择策略为**位置式**（头段+窗口），非 SnapKV 的 attention 重要性打分。
+2. 选择策略已扩展 `importance`（观察窗注意力）与 `chunk`（ChunkKV 式块级）模式；默认仍是位置式。
 3. 未做 baseline 对照的损失量化。
 
 
