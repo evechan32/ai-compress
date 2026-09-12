@@ -1,0 +1,35 @@
+{
+  "tag": "pipe-r0.5",
+  "protocol": "pipeline",
+  "model": "/models/qwen2.5-1.5b-instruct",
+  "ratio": 0.5,
+  "n": 10,
+  "files": [
+    "qasper.jsonl",
+    "multifieldqa_en.jsonl"
+  ],
+  "results": {
+    "none": {
+      "per_file": {
+        "qasper.jsonl": 0.1834,
+        "multifieldqa_en.jsonl": 0.2906
+      },
+      "mean": 0.237
+    },
+    "snapkv": {
+      "per_file": {
+        "qasper.jsonl": 0.1282,
+        "multifieldqa_en.jsonl": 0.2788
+      },
+      "mean": 0.2035
+    },
+    "kvzip": {
+      "per_file": {
+        "qasper.jsonl": 0.1804,
+        "multifieldqa_en.jsonl": 0.2683
+      },
+      "mean": 0.2243
+    }
+  },
+  "wall_s": 51.2
+}

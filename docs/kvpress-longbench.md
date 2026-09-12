@@ -4,7 +4,7 @@
 > 环境：**NVIDIA kvpress 0.5.4 + transformers 5.2.0**（隔离在 `/root/kvpress-libs`，`PYTHONPATH` 遮蔽；系统 transformers 5.16.1 未改动）
 > 设置：Qwen2.5-1.5B-Instruct；LongBench 5 任务 × n=20；HF greedy，`max_new=32`，context 截断 20000 字符。
 
-## 0. KVzip 行**作废**（调用协议错误）——它并非"不能压缩"
+## 0. KVzip 的真相：假 key 掩码式压缩（手动路径作废；pipeline 有效数字见 §0.1）
 
 关于 KVzip 曾出现两个错误解读，均已推翻。最终结论（读源码 + 探针）：
 
@@ -12,7 +12,18 @@
   → **因此用 cache 长度判断 KVzip 是否压缩是错的**：此前"未压缩 / 版本不兼容"的定性作废（§0 旧版据此得出的 15025→15025 属正常现象）。
 - **真正的问题在调用协议**：`KVzipPress.__call__` 把打分与压缩放在 `with` 块**退出之后**执行。而我们的 `bench/kvpress_eval.py` 是在 `with` 内 `generate`，压缩发生在生成**之后** → 对本次生成完全无影响。所以 KVzip 的 F1 与 baseline 逐位相同是**协议错误造成的空操作**，既不能说明"不能压缩"，也不能说明"近无损"。
 - **正确协议**（官方 `KVPressTextGenerationPipeline`）：`with` 内只 prefill **context** → 退出 `with` 时压缩（设置 `masked_key_indices`）→ **之后**再对 question 生成。
-- **待办**：KVzip 需用 pipeline 重跑才有有效数字（当前服务器两张 GPU 被外部 vLLM 30B benchmark 占满，待空闲后补）。
+### 0.1 有效数字（pipeline 协议，`docs/kvpress/pipeline-r0.5.json`）
+
+用 `bench/kvpress_pipeline_eval.py`（官方 pipeline：`with` 内 prefill context → 退出压缩 → 再生成 question），2 任务 × n=10、ratio=0.5：
+
+| method | qasper | multifieldqa_en | MEAN | Δv​s none |
+|---|---|---|---|---|
+| none | 0.1834 | 0.2906 | **0.2370** | 0 |
+| snapkv | 0.1282 | 0.2788 | 0.2035 | −0.0335 |
+| **kvzip** | 0.1804 | 0.2683 | **0.2243** | **−0.0127** |
+
+**决定性证据**：KVzip 的 F1 **不再等于 baseline**（0.2243 vs 0.2370）→ 掩码压缩**确实生效**。在 50% 预算下 KVzip 掉约 0.013、优于同协议下 snapkv 的 −0.034；即 **KVzip 能压缩，且在此预算下损失很小**。
+（注：pipeline 协议用 chat template + 原始问题，baseline 与 §1 手动协议的 0.2882 不可直接比；本表内可比。）
 
 ## 1. 结果（F1，越大越好；baseline none 在 r0.5 测得 = 0.2882）
 
@@ -25,7 +36,7 @@
 | expected（预期注意力） | 0.2630 | −0.0252 | 0.2438 | −0.0444 |
 | pyramidkv | 0.2557 | −0.0325 | 0.2743 | −0.0139 |
 | streamingllm | 0.2321 | −0.0561 | 0.2373 | −0.0509 |
-| ~~kvzip~~ | ~~0.2882~~ | **作废** | ~~0.2882~~ | **作废** |
+| ~~kvzip~~ | ~~0.2882~~ | 手动协议作废 | ~~0.2882~~ | 手动协议作废；**pipeline 有效值见 §0.1** |
 
 逐任务（r0.5）：`chunkkv` 与 baseline 几乎重合（qasper 0.3379/0.3451、mfqa 0.4086/0.3915、hotpotqa 完全持平）；`streamingllm` 在 mfqa 掉到 0.2554（vs 0.3915）。
 
@@ -41,7 +52,7 @@
 - 本次 HF baseline `qasper=0.3451` 与历史 SGLang `0.3448` 一致，但 `2wikimqa`（0.1968 vs 历史 0.1036）、`multifieldqa_en`（0.3915 vs 0.4326）不同 → **跨运行/跨引擎比较需谨慎**；本次"press vs none"同 run 可比。
 - n=20、单模型；context 截断 20000 字符；F1 部分任务噪声大。
 - 各 press 对 `compression_ratio` 的解释可能不同，横向数字仅作量级参考。
-- KVzip 行作废（调用协议错误，见 §0），不计入结论；需用官方 pipeline 重跑。
+- KVzip 手动协议行作废（调用协议错误，见 §0）；**pipeline 协议有效值：0.2243（−0.0127），见 §0.1**。
 
 ## 4. 复现
 
