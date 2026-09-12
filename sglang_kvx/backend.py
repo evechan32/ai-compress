@@ -51,7 +51,7 @@ class ScatterTritonBackend(TritonAttnBackend):
         self._kvx_free = os.environ.get("KVX_FREE", "0") == "1"
         self._kvx_mode = os.environ.get("KVX_MODE", "position")
         self._kvx_importance = (os.environ.get("KVX_IMPORTANCE", "0") == "1"
-                                or self._kvx_mode == "chunk")
+                                or self._kvx_mode in ("chunk", "importance"))
         self._kvx_budget = int(os.environ.get("KVX_BUDGET", "256"))
         self._kvx_obs = int(os.environ.get("KVX_OBS", "64"))
         self._kvx_headagg = os.environ.get("KVX_HEADAGG", "mean")
