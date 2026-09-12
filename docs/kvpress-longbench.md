@@ -18,9 +18,20 @@
   | chunkkv ratio=0.5 | **603** |
   | kvzip ratio=0.5 / 0.8 | 异常（读数 1，缓存结构与其它 press 不同） |
 
-- KVzip 在 r0.5 与 r0.8 两个比例下、5 个任务的 F1 **全部逐位等于 baseline**（10 个数完全相同）。若真的驱逐了 50–80%，greedy 输出几乎不可能完全不变 → **判定为在本调用路径下未实际生效**（尽管其自身打印了 2–3× prefill 警告）。
+- KVzip 在 r0.5 与 r0.8 两个比例下、5 个任务的 F1 **全部逐位等于 baseline**（10 个数完全相同）。若真的驱逐了 50–80%，greedy 输出几乎不可能完全不变。
 
-因此 **KVzip 一行不计入下方结论**；其正确用法需另行走官方 pipeline / 确认 `transformers 5.2.0` 兼容性（列为待办）。
+- **官方 pipeline 复核（决定性证据）**：用 `KVPressTextGenerationPipeline` + 自备 `DynamicCache`（context 15025 token），测得：
+
+  | 配置 | 压缩后 cache_len | 耗时 |
+  |---|---|---|
+  | none | 15025 | 1.6s |
+  | snapkv ratio=0.5 | **7512**（真实减半） | 1.3s |
+  | kvzip ratio=0.5 | **15025（未压缩）** | **5.8s** |
+  | kvzip ratio=0.8 | **15025（未压缩）** | 5.7s |
+
+  → KVzip **确实执行了重建打分**（耗时 ≈3.6×，与其 2–3× 警告一致），但**最终没有真正缩小 KV cache**。手动 `with` 与官方 pipeline 两种路径结果一致，故这是 **kvpress 0.5.4 + transformers 5.2.0 的版本兼容问题，而非调用姿势错误**。
+
+因此 **KVzip 一行不计入下方结论**。可行替代：① 在 transformers 4.x 环境跑 kvpress；② 用官方仓库 `snu-mllab/KVzip`；③ 用 `FastKVzipPress`（需下载 gate，HF 不可达时走镜像）。
 
 ## 1. 结果（F1，越大越好；baseline none 在 r0.5 测得 = 0.2882）
 
