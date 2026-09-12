@@ -4,34 +4,15 @@
 > 环境：**NVIDIA kvpress 0.5.4 + transformers 5.2.0**（隔离在 `/root/kvpress-libs`，`PYTHONPATH` 遮蔽；系统 transformers 5.16.1 未改动）
 > 设置：Qwen2.5-1.5B-Instruct；LongBench 5 任务 × n=20；HF greedy，`max_new=32`，context 截断 20000 字符。
 
-## 0. 重要更正：KVzip 在本路径下**未生效**（retraction）
+## 0. KVzip 行**作废**（调用协议错误）——它并非"不能压缩"
 
-初版曾把"KVzip F1 与完整注意力逐任务完全相同"解读为"50%/80% 驱逐近无损"，**该结论已撤回**。复核证据：
+关于 KVzip 曾出现两个错误解读，均已推翻。最终结论（读源码 + 探针）：
 
-- 缓存长度探针（同 prompt，`generate(max_new=4)` 后读第一层 K 的 seq 长度）：
-
-  | 配置 | KV seq 长度 |
-  |---|---|
-  | 完整注意力 | 1203 |
-  | snapkv ratio=0.5 | **603**（≈减半，压缩真实生效） |
-  | tova ratio=0.5 | **603** |
-  | chunkkv ratio=0.5 | **603** |
-  | kvzip ratio=0.5 / 0.8 | 异常（读数 1，缓存结构与其它 press 不同） |
-
-- KVzip 在 r0.5 与 r0.8 两个比例下、5 个任务的 F1 **全部逐位等于 baseline**（10 个数完全相同）。若真的驱逐了 50–80%，greedy 输出几乎不可能完全不变。
-
-- **官方 pipeline 复核（决定性证据）**：用 `KVPressTextGenerationPipeline` + 自备 `DynamicCache`（context 15025 token），测得：
-
-  | 配置 | 压缩后 cache_len | 耗时 |
-  |---|---|---|
-  | none | 15025 | 1.6s |
-  | snapkv ratio=0.5 | **7512**（真实减半） | 1.3s |
-  | kvzip ratio=0.5 | **15025（未压缩）** | **5.8s** |
-  | kvzip ratio=0.8 | **15025（未压缩）** | 5.7s |
-
-  → KVzip **确实执行了重建打分**（耗时 ≈3.6×，与其 2–3× 警告一致），但**最终没有真正缩小 KV cache**。手动 `with` 与官方 pipeline 两种路径结果一致，故这是 **kvpress 0.5.4 + transformers 5.2.0 的版本兼容问题，而非调用姿势错误**。
-
-因此 **KVzip 一行不计入下方结论**。可行替代：① 在 transformers 4.x 环境跑 kvpress；② 用官方仓库 `snu-mllab/KVzip`；③ 用 `FastKVzipPress`（需下载 gate，HF 不可达时走镜像）。
+- **机制：KVzip 在 kvpress 里是"假 key 掩码式"压缩，不是物理驱逐。** `KVzipPress.compress_post` 只写入 `module.masked_key_indices`；`attention_patch.attention_patch` 装饰器在 **decode 时**把被驱逐位置替换成满足 `exp(<q,k>)=0` 的假 key，作用于注意力计算（`kvpress/__init__.py:51` 在 import 时自动 `patch_attention_functions()`）。其文档字符串明确写着 **"does not reduce peak memory"**。
+  → **因此用 cache 长度判断 KVzip 是否压缩是错的**：此前"未压缩 / 版本不兼容"的定性作废（§0 旧版据此得出的 15025→15025 属正常现象）。
+- **真正的问题在调用协议**：`KVzipPress.__call__` 把打分与压缩放在 `with` 块**退出之后**执行。而我们的 `bench/kvpress_eval.py` 是在 `with` 内 `generate`，压缩发生在生成**之后** → 对本次生成完全无影响。所以 KVzip 的 F1 与 baseline 逐位相同是**协议错误造成的空操作**，既不能说明"不能压缩"，也不能说明"近无损"。
+- **正确协议**（官方 `KVPressTextGenerationPipeline`）：`with` 内只 prefill **context** → 退出 `with` 时压缩（设置 `masked_key_indices`）→ **之后**再对 question 生成。
+- **待办**：KVzip 需用 pipeline 重跑才有有效数字（当前服务器两张 GPU 被外部 vLLM 30B benchmark 占满，待空闲后补）。
 
 ## 1. 结果（F1，越大越好；baseline none 在 r0.5 测得 = 0.2882）
 
@@ -44,7 +25,7 @@
 | expected（预期注意力） | 0.2630 | −0.0252 | 0.2438 | −0.0444 |
 | pyramidkv | 0.2557 | −0.0325 | 0.2743 | −0.0139 |
 | streamingllm | 0.2321 | −0.0561 | 0.2373 | −0.0509 |
-| ~~kvzip~~ | ~~0.2882~~ | 未生效 | ~~0.2882~~ | 未生效 |
+| ~~kvzip~~ | ~~0.2882~~ | **作废** | ~~0.2882~~ | **作废** |
 
 逐任务（r0.5）：`chunkkv` 与 baseline 几乎重合（qasper 0.3379/0.3451、mfqa 0.4086/0.3915、hotpotqa 完全持平）；`streamingllm` 在 mfqa 掉到 0.2554（vs 0.3915）。
 
@@ -53,14 +34,14 @@
 1. **50% 驱逐下，`chunkkv` 与 `tova` 近无损**（Δ ≤ 0.001）；`snapkv`/`keydiff`/`expected`/`pyramidkv` 掉 0.017–0.033；**位置式 `streamingllm` 最差（−0.056）**。
 2. **80% 驱逐下全部退化但幅度不大**：最好的是 `snapkv`（−0.012）、`chunkkv`/`pyramidkv`（−0.014）；`tova`/`expected` 掉 0.035–0.044；`keydiff` 最差（−0.080）。→ **块级/位置混合（chunkkv、pyramidkv）与当前-query 投票（tova）在激进预算下更稳**。
 3. **与自研实现对比（关键）**：我们此前的散点/Quest/注意力分数在 ~50–60% 预算下掉得很厉害（FINAL-REPORT：qasper 0.3448→0.2166/0.2229/0.1159）。官方 press 中 chunkkv/tova 却能近无损 → **差距不在机制而在选择信号**：语义块（ChunkKV）、当前 query 投票（TOVA）明显优于我们的位置式/注意力式打分。
-4. **实证了"两遍 prefill"代价**：KVzip 运行日志明确警告 2–3× prefill 开销——正是我们分析的"多一遍 prefill"，单请求长 prompt 场景 TTFT 翻倍。
+4. **实证了"额外 prefill"代价**：KVzip 运行日志明确警告 2–3× prefill 开销，且实测耗时 1.6s→5.8s（≈3.6×），确认其重建打分确实执行。
 
 ## 3. 口径与局限（诚实披露）
 
 - 本次 HF baseline `qasper=0.3451` 与历史 SGLang `0.3448` 一致，但 `2wikimqa`（0.1968 vs 历史 0.1036）、`multifieldqa_en`（0.3915 vs 0.4326）不同 → **跨运行/跨引擎比较需谨慎**；本次"press vs none"同 run 可比。
 - n=20、单模型；context 截断 20000 字符；F1 部分任务噪声大。
 - 各 press 对 `compression_ratio` 的解释可能不同，横向数字仅作量级参考。
-- KVzip 未生效（见 §0），不计入结论。
+- KVzip 行作废（调用协议错误，见 §0），不计入结论；需用官方 pipeline 重跑。
 
 ## 4. 复现
 
