@@ -272,6 +272,13 @@ distribution metric: ChunkKV-style eviction is within noise of no eviction
 F1**. The keep-30% "gain" is within noise (and consistent with reports that removing
 distracting context can help).
 
+**5.7 Query-aware vs query-agnostic (Table 5).** Compressing *before* seeing the question
+(KVzip-style: score with uniformly sampled context queries, max aggregation) is clearly
+worse than scoring with the question: div_rate **0.407 vs 0.240** at the same retention.
+This matches the literature's finding that query visibility dominates eviction quality.
+Query-agnostic compression is therefore offered for its *reusability* (compress once,
+serve many queries / prefix caching), not for accuracy.
+
 **ZH 实验**：模型 Qwen2.5-1.5B，5 任务 × 30 样本，参考=同插件不驱逐。5.1 中性：passthrough
 与原生逐字一致；不驱逐的打分本身翻转 ~7% 贪心 token（确定性），故弃用贪心指标。5.2 结构化
 对比：位置式几乎总是分歧（1.000 / 0.933），块级注意力选择显著更低（0.147 / 0.373）。5.3 消融：
@@ -280,7 +287,9 @@ distracting context can help).
 输出与基线逐字相同却已释放块 → 读已释放显存；TRITON_ATTN 下驱逐真实且确定。5.5 吞吐（容量
 受限 + decode 为主）：keep50 1.12×、keep30 1.26×；prefill 为主时无收益。5.6 任务精度
 （LongBench F1，5×60=300 条，SE≈0.023）：无驱逐 0.2391，keep50 0.2299，keep30 0.2531，
-位置式 0.1655。**与分布指标一致：块级近无损，位置式显著掉分。**
+位置式 0.1655。**与分布指标一致：块级近无损，位置式显著掉分。** 5.7 query-agnostic
+（KVzip 式，compress 先于问题）：div_rate 0.407 vs query-aware 0.240 → 明显更差，与文献中
+"query 可见性影响大"一致；其价值在可复用而非精度。
 
 ### Tables
 
@@ -326,6 +335,13 @@ distracting context can help).
 | ChunkKV-style, keep 30% | 0.2531 | +0.014 |
 | positional (sink 64, window 1024) | 0.1655 | **−0.074** |
 
+**Table 5. Query-aware vs query-agnostic (div_rate, keep 50%).**
+
+| scoring | div_rate |
+|---|---|
+| query-aware (window, obs 16) | 0.240 |
+| query-agnostic (context, 256 sampled queries, max) | 0.407 |
+
 ---
 
 ## 6. Limitations and Future Work
@@ -349,8 +365,8 @@ distracting context can help).
 - **Per-layer/per-head budgets are inexpressible** with a single shared KV group — a
   structural constraint of the framework, worth stating explicitly as the reason
   PyramidKV/AdaKV-style allocation cannot be reproduced zero-fork.
-- **Query-agnostic** (prefix-caching/multi-turn) scoring is not implemented; KVzip-style
-  reconstruction is a natural next step.
+- **Query-agnostic** scoring is implemented (§5.7) but measurably worse than query-aware;
+  closing that gap with reconstruction-based scoring (KVzip) remains future work.
 
 ## 7. Conclusion
 
