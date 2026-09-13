@@ -34,6 +34,9 @@ _DEFAULTS = {
     "ratio": float(os.environ.get("PE_RATIO", "0")),
     "agg": os.environ.get("PE_AGG", "sum"),
     "vote_layers": int(os.environ.get("PE_VOTE_LAYERS", "1")),
+    "score_mode": os.environ.get("PE_SCORE_MODE", "window").lower(),
+    "ctx_queries": int(os.environ.get("PE_CTX_QUERIES", "256")),
+    "ctx_cap": int(os.environ.get("PE_CTX_CAP", "16384")),
 }
 
 _PE_REQ_IDS: list = []
@@ -111,6 +114,9 @@ class PromptEvictSpec(FullAttentionSpec):
     ratio: float = 0.0
     agg: str = "sum"
     vote_layers: int = 1
+    score_mode: str = "window"
+    ctx_queries: int = 256
+    ctx_cap: int = 16384
 
     @classmethod
     def merge(cls, specs):
@@ -439,6 +445,8 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
     pl_list = pl.tolist() if pl is not None else None
     kc = kv_cache.transpose(1, 2)[..., :D]
     obs = int(cfg["obs"])
+    mode = str(cfg.get("score_mode", "window")).lower()
+    cap = int(cfg.get("ctx_cap", 16384)) if mode == "context" else obs
     for r in range(len(seqlens)):
         L = int(seqlens[r])
         req_id = _PE_REQ_IDS[r] if r < len(_PE_REQ_IDS) else None
@@ -456,7 +464,7 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
             q_chunk = query[qs:qe].detach().reshape(-1, Hq, D)
             buf = _PE_Q_BUF.get(bkey)
             buf = q_chunk if buf is None else torch.cat([buf, q_chunk], dim=0)
-            _PE_Q_BUF[bkey] = buf[-obs:]
+            _PE_Q_BUF[bkey] = buf[-cap:]
         if L != prompt_len:
             continue
         buf = _PE_Q_BUF.get(bkey)
@@ -466,10 +474,19 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         blk = bt[r, :nblk].to(torch.long)
         k_all = kc[blk].reshape(nblk * bs, Hkv, D)[:L].float()
         q3 = buf.float()
-        w = min(obs, q3.shape[0])
+        if mode == "context":
+            nq = min(int(cfg.get("ctx_queries", 256)), q3.shape[0])
+            idxq = torch.linspace(0, q3.shape[0] - 1, nq).long().to(q3.device)
+            q_sel = q3[idxq]
+            w = nq
+        else:
+            w = min(obs, q3.shape[0])
+            q_sel = q3[-w:]
         kk = k_all.repeat_interleave(rep, dim=1)
-        sc = torch.einsum("whd,lhd->hwl", q3[-w:], kk) * (D ** -0.5)
-        imp = torch.softmax(sc, dim=-1).sum(dim=1).mean(dim=0)
+        sc = torch.einsum("whd,lhd->hwl", q_sel, kk) * (D ** -0.5)
+        prob = torch.softmax(sc, dim=-1)
+        imp = (prob.amax(dim=1) if mode == "context"
+               else prob.sum(dim=1)).mean(dim=0)
         acc = _PE_IMP_ACC.get(req_id)
         _PE_IMP_ACC[req_id] = imp if acc is None else acc + imp
         _PE_VOTES[req_id] = _PE_VOTES.get(req_id, 0) + 1
