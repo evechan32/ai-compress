@@ -91,8 +91,11 @@ def build_spec(base, params):
 def _block_size_of(layer) -> int:
     try:
         return int(layer.kv_cache.shape[2])
-    except Exception:
-        return int(os.environ.get("PE_BLOCK", "16"))
+    except Exception as e:
+        raise RuntimeError(
+            "pevict: 无法从 layer.kv_cache 读取 block_size（可能处于 direct-call 路径）。"
+            "拒绝回退到默认 16，以免静默算错保留集。请用 PE_MODE=chunkkv（从 kv_cache 取块大小）。"
+        ) from e
 
 
 class PromptEvictAttention(Attention):
@@ -231,6 +234,25 @@ class PromptEvictManager(FullAttentionManager):
                   f"keep={len(keep)} freed={n} "
                   f"pool {before}->{self.block_pool.get_num_free_blocks()}",
                   flush=True)
+
+    def free(self, request_id):
+        if _LOG and request_id in _PE_RETAINED:
+            print(f"[PE] free req={request_id} retained={len(_PE_RETAINED)} "
+                  f"prompt_len={len(_PE_PROMPT_LEN)} qbuf={len(_PE_Q_BUF)}",
+                  flush=True)
+        _PE_RETAINED.pop(request_id, None)
+        _PE_PROMPT_LEN.pop(request_id, None)
+        _PE_IMP_ACC.pop(request_id, None)
+        _PE_VOTES.pop(request_id, None)
+        for k in [k for k in _PE_Q_BUF if k[1] == request_id]:
+            _PE_Q_BUF.pop(k, None)
+        for k in [k for k in _PE_Q_LASTL if k[1] == request_id]:
+            _PE_Q_LASTL.pop(k, None)
+        for k in [k for k in _PE_LAYER_SEEN if k[1] == request_id]:
+            _PE_LAYER_SEEN.discard(k)
+        self._pe_logged = {k for k in self._pe_logged
+                           if not (isinstance(k, tuple) and k[0] == request_id)}
+        return super().free(request_id)
 
     def remove_skipped_blocks(self, request_id, processed_computed_tokens,
                               num_prompt_tokens=None):
