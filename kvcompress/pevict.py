@@ -46,6 +46,47 @@ _PE_Q_LASTL: dict[tuple, int] = {}
 _PE_IMP_ACC: dict[str, torch.Tensor] = {}
 _PE_VOTES: dict[str, int] = {}
 _PE_MAX_LAYER: int = -1
+_PE_VALIDATED: bool = False
+_IN_TARGET_LAYER: bool = False
+
+
+def _check_single_process() -> None:
+    v = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+    if v is not None and v not in ("0", "false", "False"):
+        raise RuntimeError(
+            "pevict 需要 VLLM_ENABLE_V1_MULTIPROCESSING=0：保留集经进程内表在"
+            "worker 与 scheduler 之间传递。"
+        )
+
+
+def _validate_config(vllm_config) -> None:
+    """一次性启动校验：把不支持的部署配置挡在启动期，而不是静默出错。"""
+    global _PE_VALIDATED
+    if _PE_VALIDATED:
+        return
+    _PE_VALIDATED = True
+    pc = getattr(vllm_config, "parallel_config", None)
+    if pc is not None:
+        tp = int(getattr(pc, "tensor_parallel_size", 1) or 1)
+        pp = int(getattr(pc, "pipeline_parallel_size", 1) or 1)
+        if tp != 1 or pp != 1:
+            raise RuntimeError(
+                f"pevict 暂不支持 TP/PP>1（当前 tp={tp} pp={pp}）：保留集经单进程表"
+                f"传递，且 block_table 在并行下会分片。"
+            )
+    sc = getattr(vllm_config, "scheduler_config", None)
+    if sc is not None and getattr(sc, "async_scheduling", False):
+        print("[PE] warn: async_scheduling 已开启；_PE_REQ_IDS 依赖调度与执行步对齐。"
+              "单进程下实测正确，但若出现请求串扰请设 VLLM_USE_ASYNC_SCHEDULING=0。",
+              flush=True)
+    cc = getattr(vllm_config, "compilation_config", None)
+    if cc is not None:
+        cm = getattr(cc, "cudagraph_mode", None)
+        if cm is not None and "NONE" not in str(getattr(cm, "name", cm)).upper():
+            raise RuntimeError(
+                f"pevict 需要关闭 CUDA graph（打分含动态 shape 与 host 同步），"
+                f"当前 cudagraph_mode={cm}；请设 enforce_eager=True。"
+            )
 
 
 def _layer_idx(layer) -> int:
@@ -100,12 +141,17 @@ def _block_size_of(layer) -> int:
 
 class PromptEvictAttention(Attention):
     def __init__(self, *args, pe_params=None, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+        global _PE_MAX_LAYER, _IN_TARGET_LAYER
+        _IN_TARGET_LAYER = True
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            _IN_TARGET_LAYER = False
         self._pe_params = pe_params or dict(_DEFAULTS)
-        global _PE_MAX_LAYER
         _PE_MAX_LAYER = max(_PE_MAX_LAYER, _layer_idx(self))
 
     def get_kv_cache_spec(self, vllm_config):
+        _validate_config(vllm_config)
         base = super().get_kv_cache_spec(vllm_config)
         if base is None:
             return None
@@ -562,6 +608,8 @@ def _patch_custom_backend():
 
     def sel(*args, **kwargs):
         cls = orig(*args, **kwargs)
+        if not _IN_TARGET_LAYER:
+            return cls
         if cls.__name__ == want:
             return backend
         raise RuntimeError(
@@ -582,6 +630,7 @@ def install(params=None, arch_module="vllm.model_executor.models.qwen2") -> None
         _patch_rswa_window(pe_params["window"])
         _patch_prefix_clamp(pe_params["sink"])
     elif _MODE in ("chunkkv", "free", "mask", "passthrough"):
+        _check_single_process()
         _PE_CFG.update(pe_params)
         _patch_req_ids()
         _patch_custom_backend()
