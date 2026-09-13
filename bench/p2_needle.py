@@ -36,6 +36,7 @@ def main():
         max_num_seqs=1,
         disable_log_stats=True,
         attention_backend=os.environ.get("PE_BACKEND") or None,
+        max_num_batched_tokens=int(os.environ.get("PE_MAXBAT", "0")) or None,
     )
     prompt = make_prompt(llm.get_tokenizer())
     ntok = len(llm.get_tokenizer().encode(prompt))

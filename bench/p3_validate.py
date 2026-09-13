@@ -42,6 +42,7 @@ def main():
         disable_log_stats=True,
         enable_prefix_caching=os.environ.get("PE_PC", "0") == "1",
         attention_backend=os.environ.get("PE_BACKEND") or None,
+        max_num_batched_tokens=int(os.environ.get("PE_MAXBAT","0")) or None,
     )
     tok = llm.get_tokenizer()
     prompts = [make_prompt(tok, c, f) for c, f in zip(CODES, FRACS)]

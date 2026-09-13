@@ -51,6 +51,7 @@ def main():
         max_num_seqs=4,
         disable_log_stats=True,
         attention_backend=os.environ.get("PE_BACKEND") or None,
+        max_num_batched_tokens=int(os.environ.get("PE_MAXBAT","0")) or None,
     )
     sp = SamplingParams(max_tokens=MAXNEW, temperature=0.0)
     samples = load_samples()
