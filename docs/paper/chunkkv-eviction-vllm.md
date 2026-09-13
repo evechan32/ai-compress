@@ -32,10 +32,11 @@ observation window spans chunks and the prompt boundary is recovered from the KV
 manager rather than the attention layer; and (iv) a **near-tie-robust evaluation
 metric** (per-step distribution distance) because greedy token agreement is dominated
 by numerical noise, not information loss. Under capacity-bound, decode-heavy serving we
-measure **1.12×–1.26× throughput** from the released blocks. We additionally report a
-silent-correctness hazard: vLLM's auto-selected FlashAttention-2 backend ignores the
-R-SWA mask while the KV manager still frees blocks, causing attention to read freed
-memory; we make this fail loudly.
+measure **1.12×–1.26× throughput** from the released blocks, with LongBench F1 within
+noise of no eviction (whereas positional eviction loses 0.074 F1). We additionally
+report a silent-correctness hazard: vLLM's auto-selected FlashAttention-2 backend
+ignores the R-SWA mask while the KV manager still frees blocks, causing attention to
+read freed memory; we make this fail loudly.
 
 **ZH 摘要**：KV 驱逐通常只是"逻辑驱逐"——掩掉但不释放块，显存没省；真正释放内存的系统
 （如 R-KV）需要 fork 框架。本文给出一种**零 fork**方案，在 vLLM 0.28 上用公开扩展点实现
@@ -262,17 +263,22 @@ there is **no gain**, because eviction saves KV memory but not prefill compute, 
 scoring adds ≈5% overhead. This delineates the regime where physical release pays off:
 long decode under KV-capacity pressure.
 
+**5.6 Task accuracy (Table 4).** Running the standard LongBench F1 harness under vLLM
+(5 tasks × 60 samples, 300 total; bootstrap-free SE ≈ 0.023) independently confirms the
+distribution metric: ChunkKV-style eviction is within noise of no eviction
+(−0.009 at keep 50%, +0.014 at keep 30%), while positional sink+window loses **0.074
+F1**. The keep-30% "gain" is within noise (and consistent with reports that removing
+distracting context can help).
+
 **ZH 实验**：模型 Qwen2.5-1.5B，5 任务 × 30 样本，参考=同插件不驱逐。5.1 中性：passthrough
 与原生逐字一致；不驱逐的打分本身翻转 ~7% 贪心 token（确定性），故弃用贪心指标。5.2 结构化
 对比：位置式几乎总是分歧（1.000 / 0.933），块级注意力选择显著更低（0.147 / 0.373）。5.3 消融：
-压缩越高分歧越多（0.147/0.373/0.527）；**观测窗越小越好**（16→0.207 vs 256→0.373，因窗口恒被
-保留、大窗稀释投票且占预算）；块内聚合 sum/mean/max 基本等价；多层投票边际（K=2/4 →
-0.267/0.253）且成本线性（K=8 OOM）。5.4 静默隐患：FA2 设了 R-SWA 元数据但从不消费掩码，
-输出与基线逐字相同却已释放块 → 读已释放显存；TRITON_ATTN 下驱逐真实且确定。已加启动护栏。
-5.5 吞吐（容量受限 + decode 为主）：M=128、512 生成，池 119,632 token（约 39 并发）；释放后
-吞吐随压缩比单调上升——keep50% 1.12×、keep30% 1.26×（重复运行稳定）。prefill 为主（T=8/256）
-时无收益：驱逐省显存不省 prefill 计算，且打分开销约 5%。这界定了物理释放的收益区间：**KV
-容量受限 + 长 decode**。
+压缩越高分歧越多（0.147/0.373/0.527）；**观测窗越小越好**（16→0.207 vs 256→0.373）；块内聚合
+基本等价；多层投票边际且成本线性。5.4 静默隐患：FA2 设了 R-SWA 元数据但从不消费掩码，
+输出与基线逐字相同却已释放块 → 读已释放显存；TRITON_ATTN 下驱逐真实且确定。5.5 吞吐（容量
+受限 + decode 为主）：keep50 1.12×、keep30 1.26×；prefill 为主时无收益。5.6 任务精度
+（LongBench F1，5×60=300 条，SE≈0.023）：无驱逐 0.2391，keep50 0.2299，keep30 0.2531，
+位置式 0.1655。**与分布指标一致：块级近无损，位置式显著掉分。**
 
 ### Tables
 
@@ -309,14 +315,24 @@ long decode under KV-capacity pressure.
 
 *(Prefill-dominated workloads show no gain: T=8 → 144.4 vs 142.1 tok/s.)*
 
+**Table 4. LongBench F1 (5 tasks × 60 samples; SE ≈ 0.023).**
+
+| config | overall F1 | Δ |
+|---|---|---|
+| no eviction | 0.2391 | — |
+| ChunkKV-style, keep 50% | 0.2299 | −0.009 |
+| ChunkKV-style, keep 30% | 0.2531 | +0.014 |
+| positional (sink 64, window 1024) | 0.1655 | **−0.074** |
+
 ---
 
 ## 6. Limitations and Future Work
 
-- **Scale.** One 1.5B model; no task-accuracy benchmark (LongBench F1/EM), no larger
-  models. Throughput gains are demonstrated only in a capacity-bound, decode-heavy
-  regime; prefill-dominated workloads show none (eviction saves memory, not prefill
-  compute).
+- **Scale.** One 1.5B model; no larger models. LongBench F1 deltas are within noise at
+  n=300 (SE≈0.023), so "lossless" here means *not distinguishable from no eviction* at
+  this sample size, not an equivalence proof. Throughput gains appear only in a
+  capacity-bound, decode-heavy regime; prefill-dominated workloads show none (eviction
+  saves memory, not prefill compute).
 - **Metric.** Distribution distance measures deviation from no-eviction, not task
   correctness; a large KL may still be a valid alternative continuation.
 - **Deployment guards not yet enforced**: TP>1, pipeline parallelism, async scheduling,
