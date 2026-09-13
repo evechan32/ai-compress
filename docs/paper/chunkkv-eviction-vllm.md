@@ -219,8 +219,10 @@ All extension points are public; the plugin is ~450 lines (`kvcompress/pevict.py
 identical to vanilla vLLM, which we use as an isolation control.
 
 Configuration: single process, TP=PP=1, `enforce_eager=True` (scoring performs
-dynamic-shape GPU work and host syncs inside the forward), and `TRITON_ATTN`. The
-backend guard fails loudly if a non-mask-capable backend is selected.
+dynamic-shape GPU work and host syncs inside the forward), and `TRITON_ATTN`. These are
+validated at startup (§6); the backend guard fails loudly if a non-mask-capable backend
+is selected, and it is scoped to the target model's own attention layers so that
+heterogeneous (encoder/cross-attention) models are not affected.
 
 ---
 
@@ -335,9 +337,12 @@ distracting context can help).
   saves memory, not prefill compute).
 - **Metric.** Distribution distance measures deviation from no-eviction, not task
   correctness; a large KL may still be a valid alternative continuation.
-- **Deployment guards not yet enforced**: TP>1, pipeline parallelism, async scheduling,
-  CUDA graphs, and multi-KV-group models are unsupported and currently only documented.
-  We are adding startup assertions.
+- **Deployment scope (now enforced at startup).** The plugin requires a single process
+  (`VLLM_ENABLE_V1_MULTIPROCESSING=0`), TP=PP=1, and CUDA graphs disabled; each is
+  checked and fails loudly with a remediation message. `async_scheduling` — on by
+  default in vLLM 0.28 — is warned about rather than blocked, because our experiments
+  ran correctly and deterministically under it in single-process mode. Multi-KV-group
+  models remain untested.
 - **Prefix caching.** Blocks shared via the prefix cache are ref-counted; our early free
   decrements the request's reference. Single-config tests pass, but the accounting under
   interleaved multi-request sharing needs proof.
