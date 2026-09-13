@@ -33,6 +33,7 @@ _DEFAULTS = {
     "obs": int(os.environ.get("PE_OBS", "64")),
     "ratio": float(os.environ.get("PE_RATIO", "0")),
     "agg": os.environ.get("PE_AGG", "sum"),
+    "vote_layers": int(os.environ.get("PE_VOTE_LAYERS", "1")),
 }
 
 _PE_REQ_IDS: list = []
@@ -40,8 +41,10 @@ _PE_RETAINED: dict[str, tuple[int, tuple[int, ...]]] = {}
 _PE_LAYER_SEEN: set = set()
 _PE_CFG: dict = {}
 _PE_PROMPT_LEN: dict[str, int] = {}
-_PE_Q_BUF: dict[str, torch.Tensor] = {}
-_PE_Q_LASTL: dict[str, int] = {}
+_PE_Q_BUF: dict[tuple, torch.Tensor] = {}
+_PE_Q_LASTL: dict[tuple, int] = {}
+_PE_IMP_ACC: dict[str, torch.Tensor] = {}
+_PE_VOTES: dict[str, int] = {}
 _PE_MAX_LAYER: int = -1
 
 
@@ -66,6 +69,7 @@ class PromptEvictSpec(FullAttentionSpec):
     obs: int = 64
     ratio: float = 0.0
     agg: str = "sum"
+    vote_layers: int = 1
 
     @classmethod
     def merge(cls, specs):
@@ -215,8 +219,12 @@ class PromptEvictManager(FullAttentionManager):
         drop = [i for i in range(nblk) if i not in keep_set]
         before = self.block_pool.get_num_free_blocks()
         n = self._free_idx(request_id, drop)
-        _PE_Q_BUF.pop(request_id, None)
-        _PE_Q_LASTL.pop(request_id, None)
+        _PE_IMP_ACC.pop(request_id, None)
+        _PE_VOTES.pop(request_id, None)
+        for k in [k for k in _PE_Q_BUF if k[1] == request_id]:
+            _PE_Q_BUF.pop(k, None)
+        for k in [k for k in _PE_Q_LASTL if k[1] == request_id]:
+            _PE_Q_LASTL.pop(k, None)
         if _LOG and (request_id, "ev") not in self._pe_logged:
             self._pe_logged.add((request_id, "ev"))
             print(f"[PE] evict chunkkv req={request_id} prompt_nblk={prompt_nblk} "
@@ -342,12 +350,16 @@ def _select_blocks(imp, L, bs, cfg, req_id):
 
 
 def _score_from_cache(layer, query, key, kv_cache, md) -> None:
-    """从 KV 池 gather 全序列 K 后打分（支持 chunked prefill）。
+    """从 KV 池 gather 全序列 K 后打分（支持 chunked prefill + 多层投票）。
 
     只在"本 chunk 走完整个 prompt"（seq_lens == prompt_len）时打分；
     此时池中已包含全部 prompt KV（本函数在 super().forward() 之后调用）。
+    最后 vote_layers 层的逐 token 重要性求平均后选块。
     """
-    if _layer_idx(layer) != _PE_MAX_LAYER:
+    li = _layer_idx(layer)
+    cfg = _PE_CFG
+    k_vote = max(1, int(cfg.get("vote_layers", 1) or 1))
+    if li < _PE_MAX_LAYER - k_vote + 1 or li > _PE_MAX_LAYER:
         return
     pl = getattr(md, "pe_prompt_lens", None)
     qsl = md.query_start_loc.tolist()
@@ -356,7 +368,6 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
     bs = int(kv_cache.shape[2])
     Hq, Hkv, D = layer.num_heads, layer.num_kv_heads, layer.head_size
     rep = max(1, Hq // Hkv)
-    cfg = _PE_CFG
     pl_list = pl.tolist() if pl is not None else None
     kc = kv_cache.transpose(1, 2)[..., :D]
     obs = int(cfg["obs"])
@@ -371,15 +382,16 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         if prompt_len is None or prompt_len <= 0 or L > prompt_len:
             continue
         qs, qe = qsl[r], qsl[r + 1]
-        if _PE_Q_LASTL.get(req_id) != L:
-            _PE_Q_LASTL[req_id] = L
+        bkey = (li, req_id)
+        if _PE_Q_LASTL.get(bkey) != L:
+            _PE_Q_LASTL[bkey] = L
             q_chunk = query[qs:qe].detach().reshape(-1, Hq, D)
-            buf = _PE_Q_BUF.get(req_id)
+            buf = _PE_Q_BUF.get(bkey)
             buf = q_chunk if buf is None else torch.cat([buf, q_chunk], dim=0)
-            _PE_Q_BUF[req_id] = buf[-obs:]
+            _PE_Q_BUF[bkey] = buf[-obs:]
         if L != prompt_len:
             continue
-        buf = _PE_Q_BUF.get(req_id)
+        buf = _PE_Q_BUF.get(bkey)
         if buf is None:
             continue
         nblk = (L + bs - 1) // bs
@@ -390,12 +402,22 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         kk = k_all.repeat_interleave(rep, dim=1)
         sc = torch.einsum("whd,lhd->hwl", q3[-w:], kk) * (D ** -0.5)
         imp = torch.softmax(sc, dim=-1).sum(dim=1).mean(dim=0)
-        nblk, keep = _select_blocks(imp, L, bs, cfg, req_id)
-        key = (layer.layer_name, req_id)
-        if _LOG and nblk > 4 and key not in _PE_LAYER_SEEN:
-            _PE_LAYER_SEEN.add(key)
+        acc = _PE_IMP_ACC.get(req_id)
+        _PE_IMP_ACC[req_id] = imp if acc is None else acc + imp
+        _PE_VOTES[req_id] = _PE_VOTES.get(req_id, 0) + 1
+        if li != _PE_MAX_LAYER:
+            continue
+        imp_avg = _PE_IMP_ACC.pop(req_id) / max(1, _PE_VOTES.pop(req_id, 1))
+        _select_blocks(imp_avg, L, bs, cfg, req_id)
+        for k in range(_PE_MAX_LAYER - k_vote + 1, _PE_MAX_LAYER + 1):
+            _PE_Q_BUF.pop((k, req_id), None)
+            _PE_Q_LASTL.pop((k, req_id), None)
+        key_seen = (layer.layer_name, req_id)
+        if _LOG and nblk > 4 and key_seen not in _PE_LAYER_SEEN:
+            _PE_LAYER_SEEN.add(key_seen)
             print(f"[PE] score layer={layer.layer_name} chunk_end={L}/{prompt_len} "
-                  f"win={w} keep={len(keep)}/{nblk}", flush=True)
+                  f"win={w} votes={k_vote} keep={len(_PE_RETAINED[req_id][1])}/{nblk}",
+                  flush=True)
 
 
 def _build_flex_backend():
