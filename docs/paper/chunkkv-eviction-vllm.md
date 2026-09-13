@@ -237,16 +237,17 @@ scoring shifts ≈7% of greedy tokens but is deterministic run-to-run — the re
 abandoned greedy agreement.
 
 **5.2 Attention-scored vs positional (Table 2).** At comparable retention, positional
-sink+window diverges almost always (div_rate 1.000 at sink=0/window=1024; 0.933 at
-sink=64), while ChunkKV-style block selection diverges far less (0.147 at 80% kept,
-0.373 at 50%). Attention-scored selection is what makes eviction usable.
+sink+window diverges almost always (div_rate 1.000 at sink=0/window=1024; 0.940 at
+sink=64), while ChunkKV-style block selection diverges far less (0.127 at 80% kept,
+0.193 at 50%). Attention-scored selection is what makes eviction usable.
 
 **5.3 Ablations (Table 1).** Divergence rate rises monotonically with compression
-(0.147/0.373/0.527 at keep 80/50/30%). Observation window: **smaller is better**
-(16→0.207 vs 256→0.373) because the window is always retained, so a large window steals
+(0.127/0.193/0.307 at keep 80/50/30%). Observation window: **smaller is better**
+(16→0.193 vs 256→0.380) because the window is always retained, so a large window steals
 budget from top-scored blocks and dilutes the vote with pre-question context. Block
-aggregation (`sum`/`mean`/`max`) is a wash (`mean≡sum` for uniform blocks). Multi-layer
-voting is marginal (K=2/4: 0.267/0.253) and costs linearly (K=8 OOM).
+aggregation is a wash (`mean ≡ sum` for uniform blocks; `max` is marginally worse,
+0.207 vs 0.193). Multi-layer voting does **not** help (K=1/2/4: 0.193/0.200/0.207) and
+costs linearly (K=8 OOM), so the default is K=1.
 
 **5.4 A silent-correctness finding.** vLLM auto-selects FlashAttention-2, which sets but
 never consumes the R-SWA mask; under FA2, R-SWA produces byte-identical output to
@@ -274,47 +275,53 @@ distracting context can help).
 
 **5.7 Query-aware vs query-agnostic (Table 5).** Compressing *before* seeing the question
 (KVzip-style: score with uniformly sampled context queries, max aggregation) is clearly
-worse than scoring with the question: div_rate **0.407 vs 0.240** at the same retention.
+worse than scoring with the question: div_rate **0.400 vs 0.193** at the same retention.
 This matches the literature's finding that query visibility dominates eviction quality.
 Query-agnostic compression is therefore offered for its *reusability* (compress once,
 serve many queries / prefix caching), not for accuracy.
 
-**ZH 实验**：模型 Qwen2.5-1.5B，5 任务 × 30 样本，参考=同插件不驱逐。5.1 中性：passthrough
-与原生逐字一致；不驱逐的打分本身翻转 ~7% 贪心 token（确定性），故弃用贪心指标。5.2 结构化
-对比：位置式几乎总是分歧（1.000 / 0.933），块级注意力选择显著更低（0.147 / 0.373）。5.3 消融：
-压缩越高分歧越多（0.147/0.373/0.527）；**观测窗越小越好**（16→0.207 vs 256→0.373）；块内聚合
-基本等价；多层投票边际且成本线性。5.4 静默隐患：FA2 设了 R-SWA 元数据但从不消费掩码，
-输出与基线逐字相同却已释放块 → 读已释放显存；TRITON_ATTN 下驱逐真实且确定。5.5 吞吐（容量
-受限 + decode 为主）：keep50 1.12×、keep30 1.26×；prefill 为主时无收益。5.6 任务精度
-（LongBench F1，5×60=300 条，SE≈0.023）：无驱逐 0.2391，keep50 0.2299，keep30 0.2531，
-位置式 0.1655。**与分布指标一致：块级近无损，位置式显著掉分。** 5.7 query-agnostic
-（KVzip 式，compress 先于问题）：div_rate 0.407 vs query-aware 0.240 → 明显更差，与文献中
-"query 可见性影响大"一致；其价值在可复用而非精度。
+**ZH 实验**：模型 Qwen2.5-1.5B，5 任务 × 30 样本，参考=同插件不驱逐（**所有数字在同一
+commit 上一次性重测，消除版本漂移**）。5.1 中性：passthrough 与原生逐字一致；不驱逐的打分
+本身翻转 ~7% 贪心 token（确定性），故弃用贪心指标。5.2 结构化对比：位置式几乎总是分歧
+（1.000 / 0.940），块级注意力选择显著更低（0.127 / 0.193）。5.3 消融：压缩越高分歧越多
+（0.127/0.193/0.307）；**观测窗越小越好**（16→0.193 vs 256→0.380）；块内聚合基本等价
+（max 略差）；**多层投票无收益**（K=1/2/4 → 0.193/0.200/0.207）且成本线性。5.4 静默隐患：
+FA2 设了 R-SWA 元数据但从不消费掩码，输出与基线逐字相同却已释放块 → 读已释放显存；
+TRITON_ATTN 下驱逐真实且确定。5.5 吞吐（容量受限 + decode 为主）：keep50 1.12×、keep30
+1.26×；prefill 为主时无收益。5.6 任务精度（LongBench F1，5×60=300 条，SE≈0.023）：无驱逐
+0.2391，keep50 0.2299，keep30 0.2531，位置式 0.1655。**与分布指标一致：块级近无损，位置式
+显著掉分。** 5.7 query-agnostic（KVzip 式，compress 先于问题）：div_rate 0.400 vs
+query-aware 0.193 → 明显更差，与文献中 query 可见性影响大的结论一致；其价值在可复用而非精度。
 
 ### Tables
 
 **Table 1. Ablations (div_rate ↓, vs no-eviction ref; lower is better).**
+*All rows re-measured in a single frozen commit against one reference.*
 
 | compression | keep 80% | keep 50% | keep 30% |
 |---|---|---|---|
-| div_rate | 0.147 | 0.373 | 0.527 |
+| div_rate | 0.127 | 0.193 | 0.307 |
 
 | obs | 16 | 32 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
-| div_rate | **0.207** | 0.247 | 0.280 | 0.360 | 0.373 |
+| div_rate | **0.193** | 0.220 | 0.287 | 0.360 | 0.380 |
+
+| block agg | sum | mean | max |
+|---|---|---|---|
+| div_rate | 0.193 | 0.193 | 0.207 |
 
 | vote_layers | 1 | 2 | 4 | 8 |
 |---|---|---|---|---|
-| div_rate | 0.280 | 0.267 | 0.253 | OOM |
+| div_rate | **0.193** | 0.200 | 0.207 | OOM |
 
 **Table 2. Attention-scored vs positional (div_rate, vs no-eviction ref).**
 
 | method | setting | div_rate |
 |---|---|---|
 | positional | sink 0, window 1024 | 1.000 |
-| positional | sink 64, window 1024 | 0.933 |
-| ChunkKV-style | keep 80% | 0.147 |
-| ChunkKV-style | keep 50% | 0.373 |
+| positional | sink 64, window 1024 | 0.940 |
+| ChunkKV-style | keep 80% | 0.127 |
+| ChunkKV-style | keep 50% | 0.193 |
 
 **Table 3. Throughput under capacity pressure (M=128, T=512, ~3k-token prompts).**
 
@@ -339,8 +346,8 @@ serve many queries / prefix caching), not for accuracy.
 
 | scoring | div_rate |
 |---|---|
-| query-aware (window, obs 16) | 0.240 |
-| query-agnostic (context, 256 sampled queries, max) | 0.407 |
+| query-aware (window, obs 16) | 0.193 |
+| query-agnostic (context, 256 sampled queries, max) | 0.400 |
 
 ---
 
