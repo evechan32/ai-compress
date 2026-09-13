@@ -32,6 +32,7 @@ _DEFAULTS = {
     "chunk": int(os.environ.get("PE_CHUNK", "16")),
     "obs": int(os.environ.get("PE_OBS", "64")),
     "ratio": float(os.environ.get("PE_RATIO", "0")),
+    "agg": os.environ.get("PE_AGG", "sum"),
 }
 
 _PE_REQ_IDS: list = []
@@ -64,6 +65,7 @@ class PromptEvictSpec(FullAttentionSpec):
     chunk: int = 16
     obs: int = 64
     ratio: float = 0.0
+    agg: str = "sum"
 
     @classmethod
     def merge(cls, specs):
@@ -309,8 +311,20 @@ def _patch_req_ids():
 
 def _select_blocks(imp, L, bs, cfg, req_id):
     nblk = (L + bs - 1) // bs
-    bscore = torch.zeros(nblk, device=imp.device)
-    bscore.index_add_(0, torch.arange(L, device=imp.device) // bs, imp)
+    idx = torch.arange(L, device=imp.device) // bs
+    agg = str(cfg.get("agg", "sum")).lower()
+    if agg == "max":
+        bscore = torch.full((nblk,), float("-inf"), device=imp.device)
+        bscore.scatter_reduce_(0, idx, imp, reduce="amax", include_self=False)
+    elif agg == "mean":
+        s = torch.zeros(nblk, device=imp.device)
+        s.index_add_(0, idx, imp)
+        c = torch.zeros(nblk, device=imp.device)
+        c.index_add_(0, idx, torch.ones_like(imp))
+        bscore = s / c.clamp_min(1.0)
+    else:
+        bscore = torch.zeros(nblk, device=imp.device)
+        bscore.index_add_(0, idx, imp)
     order = torch.argsort(bscore, descending=True).tolist()
     ratio = float(cfg.get("ratio", 0) or 0)
     budget = int(ratio * L) if ratio > 0 else int(cfg["budget"])
