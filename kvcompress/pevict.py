@@ -37,6 +37,23 @@ _DEFAULTS = {
 _PE_REQ_IDS: list = []
 _PE_RETAINED: dict[str, tuple[int, tuple[int, ...]]] = {}
 _PE_LAYER_SEEN: set = set()
+_PE_CFG: dict = {}
+_PE_PROMPT_LEN: dict[str, int] = {}
+_PE_Q_BUF: dict[str, torch.Tensor] = {}
+_PE_Q_LASTL: dict[str, int] = {}
+_PE_MAX_LAYER: int = -1
+
+
+def _layer_idx(layer) -> int:
+    name = getattr(layer, "layer_name", "") or ""
+    parts = name.split(".")
+    for i, p in enumerate(parts):
+        if p == "layers" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                return -1
+    return -1
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -76,6 +93,8 @@ class PromptEvictAttention(Attention):
     def __init__(self, *args, pe_params=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._pe_params = pe_params or dict(_DEFAULTS)
+        global _PE_MAX_LAYER
+        _PE_MAX_LAYER = max(_PE_MAX_LAYER, _layer_idx(self))
 
     def get_kv_cache_spec(self, vllm_config):
         base = super().get_kv_cache_spec(vllm_config)
@@ -136,7 +155,7 @@ class PromptEvictAttention(Attention):
                   flush=True)
 
     def forward(self, query, key, value, output_shape=None, output_dtype=None):
-        if _MODE in ("chunkkv", "mask") and key is not None:
+        if _MODE == "mask" and key is not None:
             try:
                 self._maybe_score(query, key)
             except Exception as e:
@@ -194,6 +213,8 @@ class PromptEvictManager(FullAttentionManager):
         drop = [i for i in range(nblk) if i not in keep_set]
         before = self.block_pool.get_num_free_blocks()
         n = self._free_idx(request_id, drop)
+        _PE_Q_BUF.pop(request_id, None)
+        _PE_Q_LASTL.pop(request_id, None)
         if _LOG and (request_id, "ev") not in self._pe_logged:
             self._pe_logged.add((request_id, "ev"))
             print(f"[PE] evict chunkkv req={request_id} prompt_nblk={prompt_nblk} "
@@ -204,6 +225,7 @@ class PromptEvictManager(FullAttentionManager):
     def remove_skipped_blocks(self, request_id, processed_computed_tokens,
                               num_prompt_tokens=None):
         if num_prompt_tokens is not None:
+            _PE_PROMPT_LEN[request_id] = int(num_prompt_tokens)
             done = processed_computed_tokens >= num_prompt_tokens
             if _LOG and done and (request_id, "done") not in self._pe_logged:
                 self._pe_logged.add((request_id, "done"))
@@ -285,6 +307,83 @@ def _patch_req_ids():
     cls._pe_reqids_patched = True
 
 
+def _select_blocks(imp, L, bs, cfg, req_id):
+    nblk = (L + bs - 1) // bs
+    bscore = torch.zeros(nblk, device=imp.device)
+    bscore.index_add_(0, torch.arange(L, device=imp.device) // bs, imp)
+    order = torch.argsort(bscore, descending=True).tolist()
+    ratio = float(cfg.get("ratio", 0) or 0)
+    budget = int(ratio * L) if ratio > 0 else int(cfg["budget"])
+    keep = set(range(min(int(cfg["sink"]) // bs, nblk)))
+    kept = len(keep) * bs
+    for b in order:
+        keep.add(b)
+        kept += bs
+        if kept >= budget:
+            break
+    wb = (int(cfg["obs"]) + bs - 1) // bs
+    keep.update(range(max(0, nblk - wb), nblk))
+    _PE_RETAINED[req_id] = (nblk, tuple(sorted(keep)))
+    return nblk, keep
+
+
+def _score_from_cache(layer, query, key, kv_cache, md) -> None:
+    """从 KV 池 gather 全序列 K 后打分（支持 chunked prefill）。
+
+    只在"本 chunk 走完整个 prompt"（seq_lens == prompt_len）时打分；
+    此时池中已包含全部 prompt KV（本函数在 super().forward() 之后调用）。
+    """
+    if _layer_idx(layer) != _PE_MAX_LAYER:
+        return
+    pl = getattr(md, "pe_prompt_lens", None)
+    qsl = md.query_start_loc.tolist()
+    seqlens = md.seq_lens.tolist()
+    bt = md.block_table
+    bs = int(kv_cache.shape[2])
+    Hq, Hkv, D = layer.num_heads, layer.num_kv_heads, layer.head_size
+    rep = max(1, Hq // Hkv)
+    cfg = _PE_CFG
+    pl_list = pl.tolist() if pl is not None else None
+    kc = kv_cache.transpose(1, 2)[..., :D]
+    obs = int(cfg["obs"])
+    for r in range(len(seqlens)):
+        L = int(seqlens[r])
+        req_id = _PE_REQ_IDS[r] if r < len(_PE_REQ_IDS) else None
+        if req_id is None:
+            continue
+        prompt_len = _PE_PROMPT_LEN.get(req_id)
+        if prompt_len is None and pl_list is not None:
+            prompt_len = int(pl_list[r])
+        if prompt_len is None or prompt_len <= 0 or L > prompt_len:
+            continue
+        qs, qe = qsl[r], qsl[r + 1]
+        if _PE_Q_LASTL.get(req_id) != L:
+            _PE_Q_LASTL[req_id] = L
+            q_chunk = query[qs:qe].detach().reshape(-1, Hq, D)
+            buf = _PE_Q_BUF.get(req_id)
+            buf = q_chunk if buf is None else torch.cat([buf, q_chunk], dim=0)
+            _PE_Q_BUF[req_id] = buf[-obs:]
+        if L != prompt_len:
+            continue
+        buf = _PE_Q_BUF.get(req_id)
+        if buf is None:
+            continue
+        nblk = (L + bs - 1) // bs
+        blk = bt[r, :nblk].to(torch.long)
+        k_all = kc[blk].reshape(nblk * bs, Hkv, D)[:L].float()
+        q3 = buf.float()
+        w = min(obs, q3.shape[0])
+        kk = k_all.repeat_interleave(rep, dim=1)
+        sc = torch.einsum("whd,lhd->hwl", q3[-w:], kk) * (D ** -0.5)
+        imp = torch.softmax(sc, dim=-1).sum(dim=1).mean(dim=0)
+        nblk, keep = _select_blocks(imp, L, bs, cfg, req_id)
+        key = (layer.layer_name, req_id)
+        if _LOG and nblk > 4 and key not in _PE_LAYER_SEEN:
+            _PE_LAYER_SEEN.add(key)
+            print(f"[PE] score layer={layer.layer_name} chunk_end={L}/{prompt_len} "
+                  f"win={w} keep={len(keep)}/{nblk}", flush=True)
+
+
 def _build_flex_backend():
     from vllm.v1.attention.backend import subclass_attention_backend
     from vllm.v1.attention.backends.flex_attention import (
@@ -331,15 +430,33 @@ def _build_flex_backend():
 
 
 def _build_backend():
-    from vllm.v1.attention.backend import subclass_attention_backend
+    from vllm.v1.attention.backend import subclass_attention_backend_with_overrides
     from vllm.v1.attention.backends.triton_attn import (
         TritonAttentionBackend,
+        TritonAttentionImpl,
         TritonAttentionMetadataBuilder,
     )
+
+    class PromptEvictImpl(TritonAttentionImpl):
+        def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                    output, *args, **kwargs):
+            out = super().forward(layer, query, key, value, kv_cache,
+                                  attn_metadata, output, *args, **kwargs)
+            if _MODE == "chunkkv" and attn_metadata is not None:
+                try:
+                    _score_from_cache(layer, query, key, kv_cache, attn_metadata)
+                except Exception as e:
+                    print("[PE] score warn:", type(e).__name__, str(e)[:160],
+                          flush=True)
+            return out
 
     class PromptEvictBuilder(TritonAttentionMetadataBuilder):
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+            try:
+                md.pe_prompt_lens = common_attn_metadata.rswa_prefix_lens
+            except Exception:
+                md.pe_prompt_lens = None
             if not _PE_RETAINED:
                 return md
             bt, sl = md.block_table, md.seq_lens
@@ -358,7 +475,7 @@ def _build_backend():
                 L = int(sl[r].item())
                 nblk = (L + bs - 1) // bs
                 idx = sorted(set(keep) | set(range(prompt_nblk, nblk)))
-                if not idx:
+                if len(idx) == nblk and idx == list(range(nblk)):
                     continue
                 src = bt[r][torch.tensor(idx, device=bt.device)]
                 new_bt[r, :len(idx)] = src
@@ -370,8 +487,11 @@ def _build_backend():
                 md.max_seq_len = int(new_sl.max().item())
             return md
 
-    return subclass_attention_backend("PromptEvict", TritonAttentionBackend,
-                                      PromptEvictBuilder)
+    return subclass_attention_backend_with_overrides(
+        "PromptEvict", TritonAttentionBackend,
+        {"get_builder_cls": lambda: PromptEvictBuilder,
+         "get_impl_cls": lambda: PromptEvictImpl},
+    )
 
 
 def _patch_custom_backend():
@@ -403,7 +523,8 @@ def install(params=None, arch_module="vllm.model_executor.models.qwen2") -> None
     if _MODE == "position":
         _patch_rswa_window(pe_params["window"])
         _patch_prefix_clamp(pe_params["sink"])
-    elif _MODE in ("chunkkv", "free", "mask"):
+    elif _MODE in ("chunkkv", "free", "mask", "passthrough"):
+        _PE_CFG.update(pe_params)
         _patch_req_ids()
         _patch_custom_backend()
     mod = importlib.import_module(arch_module)
