@@ -55,8 +55,10 @@ def main():
     for name, instr in probes.items():
         pids = tok(instr + text, return_tensors="pt")["input_ids"].cuda()
         off = pids.shape[1] - L
+        pos = torch.arange(L, L + pids.shape[1]).unsqueeze(0).cuda()
         with torch.no_grad():
-            o = m(pids, past_key_values=cache, output_attentions=True)
+            o = m(pids, past_key_values=cache, output_attentions=True,
+                  position_ids=pos)
         att = o.attentions[-1][0].float().cpu()
         del o
         imp = att[..., -L:, :L].amax(dim=-2).mean(0).numpy()
@@ -74,8 +76,10 @@ def main():
         rank = int((imp > imp[needle_pos]).sum())
         share = imp[needle_pos] / imp.sum()
         top = np.argsort(-imp)[:10]
+        above = np.argsort(-imp)[:rank + 1]
         print(f"[PROBE] {name:<11} needle_rank={rank}/{L} share={share*100:.3f}% "
-              f"top10={sorted(top.tolist())}", flush=True)
+              f"needle_raw={imp[needle_pos]:.5f} top_above={sorted(above[:-1].tolist())}",
+              flush=True)
         rows.append((name, rank, share))
 
     for nm, v in (("lm_sum", lm_imp), ("lm_max", lm_max)):
