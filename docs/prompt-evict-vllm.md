@@ -168,3 +168,33 @@ LongBench 5 任务 × 40 条（n=200），max_new=32，无驱逐基线 F1 = **0.
 >   PE_SCORE_MODE=window PE_OBS=32 PE_WIN_AGG=max \
 >   python -m bench.p3_needle_bench
 > ```
+
+## 附：配对精度评测（n=950 + bootstrap CI）—— 统计上站得住的版本
+
+`bench/p3_pair_eval.py`：5 任务 × 200 条（**n=950**，逐样本 F1 存盘），
+对 baseline 做**配对 bootstrap（10000 次重采样）**给 ΔF1 的 95% CI。
+CI 宽度 ±0.006–0.012 → **能检出 ~0.01 的差异**，所以"不显著"是有信息量的结论。
+
+| 配置 | F1 | ΔF1 | 95% CI | 显著？ |
+|---|---|---|---|---|
+| baseline（无驱逐） | 0.2389 | — | — | — |
+| `window+max` @保留 50% | 0.2405 | +0.0016 | [−0.0043, +0.0071] | ❌ |
+| **`window+max` @保留 20%（KV 5×）** | 0.2365 | −0.0025 | [−0.0116, +0.0066] | ❌ |
+| `context`（query-agnostic，可复用）@保留 50% | 0.2330 | −0.0059 | [−0.0151, +0.0036] | ❌ |
+| **`window+max` @保留 10%（KV 10×）** | 0.2273 | **−0.0116** | **[−0.0227, −0.0006]** | ✅ |
+| 位置式（sink64+win1024） | 0.1434 | **−0.0955** | [−0.1153, −0.0757] | ✅ |
+
+**结论**
+1. **保留 ≥20% → 损失不显著**，CI 上界 **< 1.2 分**；即 **KV 压 5× 在统计上无损**。
+2. **保留 10%（压 10×）→ 首次显著**，−0.0116（相对 ~5%）。
+3. **query-agnostic（可复用）在 50% 保留也不显著**（−0.0059，CI 含 0）。
+4. **位置式 −0.0955**，比我们压到 10% 还差 8 倍。
+
+复现：
+```bash
+P(){ env $2 PE_TAG=$1 PE_BACKEND=TRITON_ATTN PE_LOG=0 PE_N=200 \
+      python -m bench.p3_pair_eval; }
+P base   "PE_MODE=passthrough"
+P wmax20 "PE_MODE=chunkkv PE_RATIO=0.2 PE_SCORE_MODE=window PE_OBS=32 PE_WIN_AGG=max"
+PE_COMPARE=base PE_TAG=wmax20 python -m bench.p3_pair_eval   # 只看最后一行的 CI
+```
