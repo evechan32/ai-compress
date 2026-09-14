@@ -54,16 +54,36 @@ def main():
     del out2
 
     keys = cache.layers[-1].keys[0][:, :L, :].float().cpu()   # [Hkv, L, D]
+    vals = cache.layers[-1].values[0][:, :L, :].float().cpu()  # [Hkv, L, D]
     kq = torch.einsum("hid,hjd->hij", keys, keys)
     A3 = torch.softmax(kq / keys.shape[-1] ** 0.5, dim=-1)   # [Hkv, L, L]  K-as-Q
 
+    vnorm = vals.norm(dim=-1).mean(0).numpy()                # [L]  ‖V‖
     imp_lm = A1.sum(dim=-2).mean(0).numpy()            # sum over queries
     imp_kv = A2[:, :, :L].amax(dim=-2).mean(0).numpy()  # max over probe queries
     imp_ka = A3.sum(dim=-2).mean(0).numpy()
+    imp_kvf = imp_kv * vnorm                           # KVzip 最终分 = attn * ‖V‖
 
-    np.savez(f"{OUT}/imp.npz", lm=imp_lm, kvzip=imp_kv, kasq=imp_ka,
-             needle=needle_pos, L=L)
-    for name, v in (("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka)):
+    def spearman(a, b):
+        ra = np.argsort(np.argsort(a)).astype(np.float64)
+        rb = np.argsort(np.argsort(b)).astype(np.float64)
+        ra -= ra.mean()
+        rb -= rb.mean()
+        return float((ra * rb).sum() / np.sqrt((ra ** 2).sum() * (rb ** 2).sum()))
+
+    for n1, v1 in (("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka),
+                   ("vnorm", vnorm), ("kvzip*V", imp_kvf)):
+        row = []
+        for n2, v2 in (("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka),
+                       ("vnorm", vnorm), ("kvzip*V", imp_kvf)):
+            row.append(f"{spearman(v1, v2):+.2f}")
+        print(f"[SPEARMAN] {n1:>8}: " + " ".join(row), flush=True)
+
+    signals = [("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka),
+               ("vnorm", vnorm), ("kvzip*V", imp_kvf)]
+    np.savez(f"{OUT}/imp.npz", needle=needle_pos, L=L,
+             **{k: v for k, v in signals})
+    for name, v in signals:
         t = v.sum()
         print(f"COVER {name}: sink64={v[:64].sum()/t:.3f} "
               f"win128={v[-128:].sum()/t:.3f} "
@@ -75,7 +95,9 @@ def main():
     plt.figure(figsize=(13, 4))
     for name, v, c in (("LM (model's own Q)", imp_lm, "tab:blue"),
                        ("KVzip (repeat probe)", imp_kv, "tab:red"),
-                       ("K-as-Q (self-sim)", imp_ka, "tab:green")):
+                       ("K-as-Q (self-sim)", imp_ka, "tab:green"),
+                       ("||V|| norm", vnorm, "tab:orange"),
+                       ("KVzip*||V||", imp_kvf, "tab:purple")):
         plt.plot(x, v / v.sum(), label=name, color=c, lw=1.2)
     plt.axvline(needle_pos, color="k", ls="--", lw=1, label="needle")
     plt.xlabel("context position")
