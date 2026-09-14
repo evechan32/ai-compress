@@ -46,7 +46,63 @@ _PE_REQ_IDS: list = []
 _PE_RETAINED: dict[str, tuple[int, tuple[int, ...]]] = {}
 _PE_LAYER_SEEN: set = set()
 _PE_CFG: dict = {}
+_PE_VERSION: int = 0
+_PE_ATTACHED: int = -1
+
+
+def _ingest(out) -> None:
+    try:
+        pe = getattr(out, "pe_retained", None)
+        if isinstance(pe, dict):
+            _PE_RETAINED.update(pe)
+    except Exception:
+        pass
+
+
+def _patch_output_transport() -> None:
+    """TP>1：仅 rank0 的输出会回 scheduler；把 worker 的保留集附在输出上，
+    在 engine 进程落回 _PE_RETAINED（manager 读的那张表）。TP=1 同进程时是 no-op。"""
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    if not getattr(ModelRunnerOutput, "_pe_out_patched", False):
+        orig_init = ModelRunnerOutput.__init__
+
+        def init(self, *a, **kw):
+            global _PE_ATTACHED
+            orig_init(self, *a, **kw)
+            self.pe_retained = None
+            if _PE_RETAINED and _PE_ATTACHED != _PE_VERSION:
+                _PE_ATTACHED = _PE_VERSION
+                if len(_PE_RETAINED) > 4096:
+                    for k in list(_PE_RETAINED)[: len(_PE_RETAINED) - 1024]:
+                        _PE_RETAINED.pop(k, None)
+                self.pe_retained = dict(_PE_RETAINED)
+
+        ModelRunnerOutput.__init__ = init
+        ModelRunnerOutput._pe_out_patched = True
+
+    if not getattr(Executor, "_pe_exec_patched", False):
+        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+        from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+        def _wrap(cls, name):
+            orig = getattr(cls, name)
+
+            def f(self, *a, **kw):
+                out = orig(self, *a, **kw)
+                _ingest(out)
+                return out
+
+            setattr(cls, name, f)
+
+        for cls in (MultiprocExecutor, UniProcExecutor):
+            for name in ("execute_model", "sample_tokens"):
+                if hasattr(cls, name):
+                    _wrap(cls, name)
+        Executor._pe_exec_patched = True
 _PE_PROMPT_LEN: dict[str, int] = {}
+_PE_PREFILLING: dict[str, bool] = {}
 _PE_Q_BUF: dict[tuple, torch.Tensor] = {}
 _PE_Q_LASTL: dict[tuple, int] = {}
 _PE_IMP_ACC: dict[str, torch.Tensor] = {}
@@ -56,12 +112,37 @@ _PE_VALIDATED: bool = False
 _IN_TARGET_LAYER: bool = False
 
 
-def _check_single_process() -> None:
-    v = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
-    if v is not None and v not in ("0", "false", "False"):
+def _tp_all_reduce(x):
+    """把各 rank 的局部重要性求和，保证所有 rank 得到同一份全局分数。"""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        g = get_tp_group()
+        if g is not None and getattr(g, "world_size", 1) > 1:
+            return g.all_reduce(x)
+    except Exception:
+        pass
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    except Exception:
+        pass
+    return x
+
+
+def _check_process_mode(tp: int) -> None:
+    mp = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    on = str(mp).lower() not in ("0", "false")
+    if tp > 1:
+        if not on:
+            raise RuntimeError(
+                "pevict: TP>1 需要 VLLM_ENABLE_V1_MULTIPROCESSING=1"
+                "（保留集经 ModelRunnerOutput 回传）。"
+            )
+    elif on:
         raise RuntimeError(
-            "pevict 需要 VLLM_ENABLE_V1_MULTIPROCESSING=0：保留集经进程内表在"
-            "worker 与 scheduler 之间传递。"
+            "pevict: TP=1 需要 VLLM_ENABLE_V1_MULTIPROCESSING=0"
+            "（保留集经进程内表直传）。"
         )
 
 
@@ -75,11 +156,19 @@ def _validate_config(vllm_config) -> None:
     if pc is not None:
         tp = int(getattr(pc, "tensor_parallel_size", 1) or 1)
         pp = int(getattr(pc, "pipeline_parallel_size", 1) or 1)
-        if tp != 1 or pp != 1:
+        if pp != 1:
             raise RuntimeError(
-                f"pevict 暂不支持 TP/PP>1（当前 tp={tp} pp={pp}）：保留集经单进程表"
-                f"传递，且 block_table 在并行下会分片。"
+                f"pevict 暂不支持 PP>1（当前 pp={pp}）：打分发生在最后一层，跨 stage 无对应机制。"
             )
+        _check_process_mode(tp)
+        if tp > 1:
+            sc0 = getattr(vllm_config, "scheduler_config", None)
+            if sc0 is not None and getattr(sc0, "async_scheduling", False):
+                raise RuntimeError(
+                    "pevict: TP>1 需关闭 async_scheduling（保留集回传依赖步序）。"
+                    "请设 VLLM_USE_ASYNC_SCHEDULING=0。"
+                )
+            _patch_output_transport()
     sc = getattr(vllm_config, "scheduler_config", None)
     if sc is not None and getattr(sc, "async_scheduling", False):
         print("[PE] warn: async_scheduling 已开启；_PE_REQ_IDS 依赖调度与执行步对齐。"
@@ -216,6 +305,8 @@ class PromptEvictAttention(Attention):
         wb = (w + bs - 1) // bs
         keep.update(range(max(0, nblk - wb), nblk))
         _PE_RETAINED[req_id] = (nblk, tuple(sorted(keep)))
+        global _PE_VERSION
+        _PE_VERSION += 1
         if _LOG and nblk > 4 and self.layer_name not in _PE_LAYER_SEEN:
             _PE_LAYER_SEEN.add(self.layer_name)
             print(f"[PE] score layer={self.layer_name} keep={len(keep)}/{nblk}",
@@ -388,7 +479,19 @@ def _patch_req_ids():
 
     def prepare(self, input_batch, *args, **kwargs):
         try:
-            _PE_REQ_IDS[:] = list(input_batch.req_ids)[: input_batch.num_reqs]
+            ids = list(input_batch.req_ids)[: input_batch.num_reqs]
+            _PE_REQ_IDS[:] = ids
+            pl = getattr(input_batch, "prompt_lens", None)
+            if pl is not None:
+                vals = pl.tolist() if hasattr(pl, "tolist") else list(pl)
+                for i, rid in enumerate(ids):
+                    if i < len(vals):
+                        _PE_PROMPT_LEN[rid] = int(vals[i])
+            ip = getattr(input_batch, "is_prefilling_np", None)
+            if ip is not None:
+                for i, rid in enumerate(ids):
+                    if i < len(ip):
+                        _PE_PREFILLING[rid] = bool(ip[i])
         except Exception:
             pass
         return orig(self, input_batch, *args, **kwargs)
@@ -426,6 +529,8 @@ def _select_blocks(imp, L, bs, cfg, req_id):
     wb = (int(cfg["obs"]) + bs - 1) // bs
     keep.update(range(max(0, nblk - wb), nblk))
     _PE_RETAINED[req_id] = (nblk, tuple(sorted(keep)))
+    global _PE_VERSION
+    _PE_VERSION += 1
     return nblk, keep
 
 
@@ -498,20 +603,17 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         req_id = _PE_REQ_IDS[r] if r < len(_PE_REQ_IDS) else None
         if req_id is None:
             continue
-        prompt_len = _PE_PROMPT_LEN.get(req_id)
-        if prompt_len is None and pl_list is not None:
-            prompt_len = int(pl_list[r])
-        if prompt_len is None or prompt_len <= 0 or L > prompt_len:
-            continue
         qs, qe = qsl[r], qsl[r + 1]
         bkey = (li, req_id)
-        if _PE_Q_LASTL.get(bkey) != L:
-            _PE_Q_LASTL[bkey] = L
-            q_chunk = query[qs:qe].detach().reshape(-1, Hq, D)
-            buf = _PE_Q_BUF.get(bkey)
-            buf = q_chunk if buf is None else torch.cat([buf, q_chunk], dim=0)
-            _PE_Q_BUF[bkey] = buf[-cap:]
-        if L != prompt_len:
+        if _PE_PREFILLING.get(req_id, True):
+            if _PE_Q_LASTL.get(bkey) != L:
+                _PE_Q_LASTL[bkey] = L
+                q_chunk = query[qs:qe].detach().reshape(-1, Hq, D)
+                buf = _PE_Q_BUF.get(bkey)
+                buf = q_chunk if buf is None else torch.cat([buf, q_chunk], dim=0)
+                _PE_Q_BUF[bkey] = buf[-cap:]
+            continue
+        if req_id in _PE_RETAINED:
             continue
         buf = _PE_Q_BUF.get(bkey)
         if buf is None:
@@ -546,6 +648,7 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         if li != _PE_MAX_LAYER:
             continue
         imp_avg = _PE_IMP_ACC.pop(req_id) / max(1, _PE_VOTES.pop(req_id, 1))
+        imp_avg = _tp_all_reduce(imp_avg)
         _select_blocks(imp_avg, L, bs, cfg, req_id)
         for k in range(_PE_MAX_LAYER - k_vote + 1, _PE_MAX_LAYER + 1):
             _PE_Q_BUF.pop((k, req_id), None)
@@ -553,7 +656,7 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         key_seen = (layer.layer_name, req_id)
         if _LOG and nblk > 4 and key_seen not in _PE_LAYER_SEEN:
             _PE_LAYER_SEEN.add(key_seen)
-            print(f"[PE] score layer={layer.layer_name} chunk_end={L}/{prompt_len} "
+            print(f"[PE] score layer={layer.layer_name} at_L={L} "
                   f"win={w} votes={k_vote} keep={len(_PE_RETAINED[req_id][1])}/{nblk}",
                   flush=True)
 
@@ -700,10 +803,10 @@ def install(params=None, arch_module="vllm.model_executor.models.qwen2") -> None
         _patch_rswa_window(pe_params["window"])
         _patch_prefix_clamp(pe_params["sink"])
     elif _MODE in ("chunkkv", "free", "mask", "passthrough"):
-        _check_single_process()
         _PE_CFG.update(pe_params)
         _patch_req_ids()
         _patch_custom_backend()
+        _patch_output_transport()
     mod = importlib.import_module(arch_module)
     if not hasattr(mod, "Attention"):
         raise ValueError(f"{arch_module} 未导出 Attention")

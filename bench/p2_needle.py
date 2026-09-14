@@ -1,7 +1,6 @@
 """P2 判定实验：needle 在中段，验证驱逐是否真的影响注意力。"""
 import os
 
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 os.environ.setdefault("PE_LOG", "1")
 os.environ.setdefault("PE_MODE", "off")
@@ -37,6 +36,8 @@ def main():
         disable_log_stats=True,
         attention_backend=os.environ.get("PE_BACKEND") or None,
         max_num_batched_tokens=int(os.environ.get("PE_MAXBAT", "0")) or None,
+        tensor_parallel_size=int(os.environ.get("PE_TP", "1")),
+        async_scheduling=os.environ.get("PE_ASYNC", "1") == "1",
     )
     prompt = make_prompt(llm.get_tokenizer())
     ntok = len(llm.get_tokenizer().encode(prompt))

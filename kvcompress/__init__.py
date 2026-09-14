@@ -16,6 +16,14 @@ def _apply_env_defaults() -> None:
 def entrypoint():
     """vllm.general_plugins 入口：所有进程加载时执行。"""
     _apply_env_defaults()
+    import os
+    if os.environ.get("PE_MODE", "off") != "off":
+        try:
+            import kvcompress.pevict as pevict
+            pevict.install()
+        except Exception as e:
+            print(f"[PE] entrypoint install warn: {type(e).__name__} {str(e)[:160]}",
+                  flush=True)
     from kvcompress import config
     cfg = config.load_config()
     if not cfg.enabled:
