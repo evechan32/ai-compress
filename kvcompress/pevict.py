@@ -37,6 +37,8 @@ _DEFAULTS = {
     "score_mode": os.environ.get("PE_SCORE_MODE", "window").lower(),
     "ctx_queries": int(os.environ.get("PE_CTX_QUERIES", "256")),
     "ctx_cap": int(os.environ.get("PE_CTX_CAP", "16384")),
+    "use_covariance": os.environ.get("PE_USE_COV", "1") == "1",
+    "use_vnorm": os.environ.get("PE_USE_VNORM", "1") == "1",
 }
 
 _PE_REQ_IDS: list = []
@@ -117,6 +119,8 @@ class PromptEvictSpec(FullAttentionSpec):
     score_mode: str = "window"
     ctx_queries: int = 256
     ctx_cap: int = 16384
+    use_covariance: bool = True
+    use_vnorm: bool = True
 
     @classmethod
     def merge(cls, specs):
@@ -423,6 +427,46 @@ def _select_blocks(imp, L, bs, cfg, req_id):
     return nblk, keep
 
 
+def _avg_rope(D, theta, n_future, device, dtype):
+    """未来 n_future 个位置的 RoPE 平均旋转矩阵 R_avg = mean_Δ R(Δ)。"""
+    inv = 1.0 / (theta ** (torch.arange(0, D, 2, device=device).float() / D))
+    f = torch.outer(torch.arange(1, n_future + 1, device=device).float(), inv)
+    emb = torch.cat([f, f], dim=-1)
+    cos, sin = emb.cos().mean(0), emb.sin().mean(0)
+    eye = torch.eye(D, device=device, dtype=dtype)
+    P = torch.zeros(D, D, device=device, dtype=dtype)
+    P[D // 2:, : D // 2] = torch.eye(D // 2, device=device, dtype=dtype)
+    P[: D // 2, D // 2:] = -torch.eye(D // 2, device=device, dtype=dtype)
+    return cos.unsqueeze(1) * eye + sin.unsqueeze(1) * P
+
+
+def _expected_imp(buf, k_all, kv_cache, blk, nblk, bs, Hq, Hkv, D, rep, cfg):
+    """ExpectedAttention 式打分（query-agnostic）。
+
+    score_j = softmax_j(k_j·μ/√d + ½·k_jΣk_jᵀ/d) · ‖v_j‖，μ/Σ 为 query 的均值/协方差。
+    未来位置用 n_future 个位置的 RoPE 平均旋转近似（RoPE 分块旋转可交换，故直接作用于
+    post-RoPE query 与 kvpress 的 avg-RoPE 等价）。
+    """
+    q = buf[min(int(cfg.get("sink", 0)), max(0, buf.shape[0] - 1)):].float()
+    R = _avg_rope(D, float(cfg.get("rope_theta", 1e6)),
+                  int(cfg.get("n_future", 512)), q.device, q.dtype)
+    q = q @ R.T
+    mu = q.mean(dim=0)
+    ke = k_all.repeat_interleave(rep, dim=1)
+    logits = torch.einsum("lhd,hd->lh", ke, mu) * (D ** -0.5)
+    if cfg.get("use_covariance", True) and q.shape[0] > 1:
+        cen = q - mu
+        cov = torch.einsum("qhd,qhe->hde", cen, cen) / q.shape[0]
+        logits = logits + 0.5 * torch.einsum("lhd,hde,lhe->lh", ke, cov, ke) / D
+    p = torch.softmax(logits, dim=0)
+    p_grp = p.view(k_all.shape[0], Hkv, rep).mean(dim=2)
+    if cfg.get("use_vnorm", True):
+        vc = kv_cache.transpose(1, 2)[..., D:]
+        v_all = vc[blk].reshape(nblk * bs, Hkv, D)[:k_all.shape[0]].float()
+        p_grp = p_grp * v_all.norm(dim=-1)
+    return p_grp.mean(dim=1)
+
+
 def _score_from_cache(layer, query, key, kv_cache, md) -> None:
     """从 KV 池 gather 全序列 K 后打分（支持 chunked prefill + 多层投票）。
 
@@ -446,7 +490,7 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
     kc = kv_cache.transpose(1, 2)[..., :D]
     obs = int(cfg["obs"])
     mode = str(cfg.get("score_mode", "window")).lower()
-    cap = int(cfg.get("ctx_cap", 16384)) if mode == "context" else obs
+    cap = int(cfg.get("ctx_cap", 16384)) if mode in ("context", "expected") else obs
     for r in range(len(seqlens)):
         L = int(seqlens[r])
         req_id = _PE_REQ_IDS[r] if r < len(_PE_REQ_IDS) else None
@@ -473,20 +517,25 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         nblk = (L + bs - 1) // bs
         blk = bt[r, :nblk].to(torch.long)
         k_all = kc[blk].reshape(nblk * bs, Hkv, D)[:L].float()
-        q3 = buf.float()
-        if mode == "context":
-            nq = min(int(cfg.get("ctx_queries", 256)), q3.shape[0])
-            idxq = torch.linspace(0, q3.shape[0] - 1, nq).long().to(q3.device)
-            q_sel = q3[idxq]
-            w = nq
+        if mode == "expected":
+            imp = _expected_imp(buf, k_all, kv_cache, blk, nblk, bs,
+                                Hq, Hkv, D, rep, cfg)
+            w = buf.shape[0]
         else:
-            w = min(obs, q3.shape[0])
-            q_sel = q3[-w:]
-        kk = k_all.repeat_interleave(rep, dim=1)
-        sc = torch.einsum("whd,lhd->hwl", q_sel, kk) * (D ** -0.5)
-        prob = torch.softmax(sc, dim=-1)
-        imp = (prob.amax(dim=1) if mode == "context"
-               else prob.sum(dim=1)).mean(dim=0)
+            q3 = buf.float()
+            if mode == "context":
+                nq = min(int(cfg.get("ctx_queries", 256)), q3.shape[0])
+                idxq = torch.linspace(0, q3.shape[0] - 1, nq).long().to(q3.device)
+                q_sel = q3[idxq]
+                w = nq
+            else:
+                w = min(obs, q3.shape[0])
+                q_sel = q3[-w:]
+            kk = k_all.repeat_interleave(rep, dim=1)
+            sc = torch.einsum("whd,lhd->hwl", q_sel, kk) * (D ** -0.5)
+            prob = torch.softmax(sc, dim=-1)
+            imp = (prob.amax(dim=1) if mode == "context"
+                   else prob.sum(dim=1)).mean(dim=0)
         acc = _PE_IMP_ACC.get(req_id)
         _PE_IMP_ACC[req_id] = imp if acc is None else acc + imp
         _PE_VOTES[req_id] = _PE_VOTES.get(req_id, 0) + 1
