@@ -39,6 +39,7 @@ _DEFAULTS = {
     "ctx_cap": int(os.environ.get("PE_CTX_CAP", "16384")),
     "use_covariance": os.environ.get("PE_USE_COV", "1") == "1",
     "use_vnorm": os.environ.get("PE_USE_VNORM", "1") == "1",
+    "win_agg": os.environ.get("PE_WIN_AGG", "sum").lower(),
 }
 
 _PE_REQ_IDS: list = []
@@ -121,6 +122,7 @@ class PromptEvictSpec(FullAttentionSpec):
     ctx_cap: int = 16384
     use_covariance: bool = True
     use_vnorm: bool = True
+    win_agg: str = "sum"
 
     @classmethod
     def merge(cls, specs):
@@ -534,8 +536,10 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
             kk = k_all.repeat_interleave(rep, dim=1)
             sc = torch.einsum("whd,lhd->hwl", q_sel, kk) * (D ** -0.5)
             prob = torch.softmax(sc, dim=-1)
-            imp = (prob.amax(dim=1) if mode == "context"
-                   else prob.sum(dim=1)).mean(dim=0)
+            if mode == "context" or str(cfg.get("win_agg", "sum")).lower() == "max":
+                imp = prob.amax(dim=1).mean(dim=0)
+            else:
+                imp = prob.sum(dim=1).mean(dim=0)
         acc = _PE_IMP_ACC.get(req_id)
         _PE_IMP_ACC[req_id] = imp if acc is None else acc + imp
         _PE_VOTES[req_id] = _PE_VOTES.get(req_id, 0) + 1
