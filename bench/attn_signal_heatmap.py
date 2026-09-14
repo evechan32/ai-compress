@@ -59,7 +59,8 @@ def main():
     A3 = torch.softmax(kq / keys.shape[-1] ** 0.5, dim=-1)   # [Hkv, L, L]  K-as-Q
 
     vnorm = vals.norm(dim=-1).mean(0).numpy()                # [L]  ‖V‖
-    imp_lm = A1.sum(dim=-2).mean(0).numpy()            # sum over queries
+    imp_lm = A1.sum(dim=-2).mean(0).numpy()
+    imp_lmmax = A1.amax(dim=-2).mean(0).numpy()
     imp_kv = A2[:, :, :L].amax(dim=-2).mean(0).numpy()  # max over probe queries
     imp_ka = A3.sum(dim=-2).mean(0).numpy()
     imp_kvf = imp_kv * vnorm                           # KVzip 最终分 = attn * ‖V‖
@@ -72,15 +73,44 @@ def main():
         return float((ra * rb).sum() / np.sqrt((ra ** 2).sum() * (rb ** 2).sum()))
 
     for n1, v1 in (("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka),
-                   ("vnorm", vnorm), ("kvzip*V", imp_kvf)):
+                   ("vnorm", vnorm), ("kvzip*V", imp_kvf), ("lm_max", imp_lmmax)):
         row = []
         for n2, v2 in (("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka),
-                       ("vnorm", vnorm), ("kvzip*V", imp_kvf)):
+                       ("vnorm", vnorm), ("kvzip*V", imp_kvf), ("lm_max", imp_lmmax)):
             row.append(f"{spearman(v1, v2):+.2f}")
         print(f"[SPEARMAN] {n1:>8}: " + " ".join(row), flush=True)
 
+    lm_argmax = A1.argmax(dim=-1)
+    lm_sink = float((lm_argmax == 0).float().mean())
+    lm_diag_mass = float(A1.diagonal(dim1=-2, dim2=-1).mean())
+    probe_offset = pids.shape[1] - L
+    kv_argmax = A2[:, :, :L].argmax(dim=-1)
+    probe_q = torch.arange(probe_offset, kv_argmax.shape[1])
+    source_pos = probe_q - probe_offset
+    kv_copy = float((kv_argmax[:, probe_q] == source_pos.unsqueeze(0)).float().mean())
+    kv_diag_mass = float(A2[:, probe_q, :L].diagonal(dim1=-2, dim2=-1).mean())
+    print(f"[STRUCT] LM   : argmax==key0(sink) rate={lm_sink:.3f} "
+          f"| main-diagonal mean mass={lm_diag_mass:.4f}", flush=True)
+    print(f"[STRUCT] KVzip: probe->source copy rate={kv_copy:.3f} "
+          f"| shifted-diagonal mean mass={kv_diag_mass:.4f}", flush=True)
+
+    lm_off = (lm_argmax - torch.arange(L).view(1, L)).reshape(-1)
+    print("[STRUCT] LM argmax offset (key - query) top:", flush=True)
+    for o, c in sorted(((int(v), int((lm_off == v).sum()))
+                        for v in lm_off.unique().tolist()),
+                       key=lambda x: -x[1])[:8]:
+        print(f"          offset={o:+d}  count={c}  ({c/lm_off.numel()*100:.1f}%)",
+              flush=True)
+    kv_off = (kv_argmax[:, probe_q] - source_pos.unsqueeze(0)).reshape(-1)
+    print("[STRUCT] KVzip argmax offset (hit key - source pos) top:", flush=True)
+    for o, c in sorted(((int(v), int((kv_off == v).sum()))
+                        for v in kv_off.unique().tolist()),
+                       key=lambda x: -x[1])[:8]:
+        print(f"          offset={o:+d}  count={c}  ({c/kv_off.numel()*100:.1f}%)",
+              flush=True)
+
     signals = [("lm", imp_lm), ("kvzip", imp_kv), ("kasq", imp_ka),
-               ("vnorm", vnorm), ("kvzip*V", imp_kvf)]
+               ("vnorm", vnorm), ("kvzip*V", imp_kvf), ("lm_max", imp_lmmax)]
     np.savez(f"{OUT}/imp.npz", needle=needle_pos, L=L,
              **{k: v for k, v in signals})
     for name, v in signals:
