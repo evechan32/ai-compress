@@ -85,3 +85,26 @@ PE_MODE=chunkkv PE_BACKEND=TRITON_ATTN PE_BUDGET=64 PE_OBS=64 python -m bench.p2
 注意力仍在读已释放块。已在 `kvcompress/adapter.py` 加 `_patch_backend_guard`：
 RSWA 启用时若 backend 不支持掩码则**启动即报错**，`AI_COMPRESS_FORCE_BACKEND=1` 可自动换
 `TritonAttentionBackend`。**旧有的"无损 24/24"结论在 FA2 下不成立，需在 TRITON_ATTN 下重测。**
+
+## 附：三种打分模式对比 + 指标局限（2026-09，冻结版）
+
+| 打分模式 | 依赖 query | 额外前向 | LongBench F1 (ratio0.5, n=300) | div_rate |
+|---|---|---|---|---|
+| `window`（问题末尾窗口） | ✅ | ❌ | 0.2299 (−0.009) | **0.193** |
+| `context`（全 prompt 采样 max） | ❌ | ❌ | **0.2361 (−0.003)** | 0.400 |
+| `expected`（ExpectedAttention 式） | ❌ | ❌ | 0.2217 (−0.017) | 0.480 |
+
+（无驱逐基线 F1 = 0.2391；SE≈0.023，故三者差值都在噪声内。）
+
+**关键结论：`div_rate` 与 F1 的跨方法排序不一致。**
+`div_rate` 说 window 最好、context 最差；F1 说 context 最好、expected 最差。
+原因：`div_rate` 衡量的是"分布偏移"，而一个小模型在高熵/退化位置上的贪心 token
+对数值扰动极敏感——**分布偏移 ≠ 任务损失**。所以：
+
+- `div_rate` 只适合**同一方法族内的压缩比扫描**（我们实测它随压缩单调）；
+- **跨方法比较必须用 F1**（或其它任务指标）。
+
+另外：**`context` 模式在 F1 上近无损（−0.003）且是 query-agnostic（可复用）**——这比
+`div_rate` 给出的印象好得多，说明"廉价 query-agnostic"这条路的实际可用性被低估了。
+`expected` 的 F1 最差，说明按 (μ,Σ) 的解析期望注意力在这个小模型上并不比朴素采样更准。
+

@@ -372,8 +372,15 @@ query-aware 0.193 → 明显更差，与文献中 query 可见性影响大的结
 - **Per-layer/per-head budgets are inexpressible** with a single shared KV group — a
   structural constraint of the framework, worth stating explicitly as the reason
   PyramidKV/AdaKV-style allocation cannot be reproduced zero-fork.
-- **Query-agnostic** scoring is implemented (§5.7) but measurably worse than query-aware;
-  closing that gap with reconstruction-based scoring (KVzip) remains future work.
+- **Metric caveat.** Our distribution-distance metric ranks scoring rules differently
+  from task F1 (it prefers query-aware window scoring; F1 prefers query-agnostic context
+  mode). It measures *distribution shift*, not task loss, and is only reliable *within*
+  a method family (where it is monotonic in compression); cross-method comparisons must
+  use F1. We therefore treat F1 as primary and the distribution metric as a diagnostic.
+- **Query-agnostic scoring.** A cheap query-agnostic mode (uniform context-query sampling,
+  max aggregation) is essentially lossless on F1 (−0.003, within noise) and is reusable;
+  ExpectedAttention-style analytic scoring was worse (−0.017). Faithful KVzip-style
+  reconstruction (§Related Work) remains future work.
 
 ## 7. Conclusion
 
