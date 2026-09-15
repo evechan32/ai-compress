@@ -165,14 +165,14 @@ def _validate_config(vllm_config) -> None:
             sc0 = getattr(vllm_config, "scheduler_config", None)
             if sc0 is not None and getattr(sc0, "async_scheduling", False):
                 raise RuntimeError(
-                    "pevict: TP>1 需关闭 async_scheduling（保留集回传依赖步序）。"
-                    "请设 VLLM_USE_ASYNC_SCHEDULING=0。"
+                    "pevict: TP>1 需关闭 async_scheduling（保留集回传依赖调度/执行步对齐）。"
+                    "LLM 侧传 async_scheduling=False，serve 侧加 --no-async-scheduling。"
                 )
             _patch_output_transport()
     sc = getattr(vllm_config, "scheduler_config", None)
     if sc is not None and getattr(sc, "async_scheduling", False):
         print("[PE] warn: async_scheduling 已开启；_PE_REQ_IDS 依赖调度与执行步对齐。"
-              "单进程下实测正确，但若出现请求串扰请设 VLLM_USE_ASYNC_SCHEDULING=0。",
+              "单进程下实测正确，但若出现请求串扰请传 async_scheduling=False。",
               flush=True)
     cc = getattr(vllm_config, "compilation_config", None)
     if cc is not None:
