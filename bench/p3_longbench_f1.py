@@ -50,14 +50,19 @@ def _f1(pred, golds):
 
 def main():
     mode = os.environ["PE_MODE"]
+    _kw = {}
+    if os.environ.get("PE_ASYNC") is not None:
+        _kw["async_scheduling"] = os.environ["PE_ASYNC"] == "1"
     llm = LLM(
-        model="/models/qwen2.5-1.5b-instruct",
-        max_model_len=8192,
-        gpu_memory_utilization=0.6,
+        model=os.environ.get("PE_MODEL", "/models/qwen2.5-1.5b-instruct"),
+        max_model_len=int(os.environ.get("PE_MAXLEN", "8192")),
+        gpu_memory_utilization=float(os.environ.get("PE_GMEM", "0.6")),
         enforce_eager=True,
         max_num_seqs=4,
         disable_log_stats=True,
         attention_backend=os.environ.get("PE_BACKEND") or None,
+        tensor_parallel_size=int(os.environ.get("PE_TP", "1")),
+        **_kw,
     )
     sp = SamplingParams(max_tokens=MAXNEW, temperature=0.0)
     per_task, agg = {}, []
@@ -78,7 +83,9 @@ def main():
         print(f"[F1] {fn}: n={len(f1s)} f1={per_task[fn]}", flush=True)
     print(f"[F1] mode={mode} ratio={os.environ.get('PE_RATIO','0')} "
           f"overall={round(sum(agg)/len(agg), 4)} per_task={per_task}", flush=True)
-    json.dump(per_task, open(f"/root/ai-compress/bench/out/f1-{mode}.json", "w"))
+    json.dump(per_task,
+              open(f"/root/ai-compress/bench/out/f1-{mode}-"
+                   f"{os.environ.get('PE_RATIO','0')}.json", "w"))
 
 
 if __name__ == "__main__":
