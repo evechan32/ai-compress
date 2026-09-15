@@ -218,11 +218,24 @@ All extension points are public; the plugin is ~450 lines (`kvcompress/pevict.py
 `passthrough` mode (backsend+spec installed, no scoring/eviction) is numerically
 identical to vanilla vLLM, which we use as an isolation control.
 
-Configuration: single process, TP=PP=1, `enforce_eager=True` (scoring performs
-dynamic-shape GPU work and host syncs inside the forward), and `TRITON_ATTN`. These are
-validated at startup (§6); the backend guard fails loudly if a non-mask-capable backend
-is selected, and it is scoped to the target model's own attention layers so that
-heterogeneous (encoder/cross-attention) models are not affected.
+Configuration: `enforce_eager=True` (scoring performs dynamic-shape GPU work and host
+syncs inside the forward), `TRITON_ATTN`, and PP=1. **TP=1 runs single-process
+(`VLLM_ENABLE_V1_MULTIPROCESSING=0`); TP>1 is supported** by all-reducing the local
+importance across ranks — so every rank selects the same blocks — and returning the
+retained set to the engine attached to `ModelRunnerOutput`. Under TP>1 the workers are
+separate spawned processes, so the process-local rendezvous of §3.2 does not apply; the
+hand-off is step-aligned and therefore requires `async_scheduling=False`, and the transport
+hook must patch the concrete `MultiprocExecutor`/`UniProcExecutor` classes rather than the
+base class. All configuration is validated at startup (§6); the backend guard fails loudly
+if a non-mask-capable backend is selected, and it is scoped to the target model's own
+attention layers so that heterogeneous (encoder/cross-attention) models are not affected.
+
+**ZH 实现**：配置为 `enforce_eager=True`、`TRITON_ATTN`、PP=1。TP=1 单进程运行
+（`VLLM_ENABLE_V1_MULTIPROCESSING=0`）；**TP>1 已支持**：在各 rank 间对局部重要性做
+all-reduce（保证各 rank 选出同一批块），并把保留集附在 `ModelRunnerOutput` 上回传 engine。
+TP>1 下 worker 是独立 spawn 进程，§3.2 的进程内 rendezvous 不再适用；该回传依赖调度步对齐，
+因此要求 `async_scheduling=False`，且必须 patch 具体的 `MultiprocExecutor`/`UniProcExecutor`
+类（基类方法被覆写）。以上均在启动期校验（§6）。
 
 ---
 
@@ -280,6 +293,18 @@ This matches the literature's finding that query visibility dominates eviction q
 Query-agnostic compression is therefore offered for its *reusability* (compress once,
 serve many queries / prefix caching), not for accuracy.
 
+**5.8 Model scale and tensor parallelism.** The mechanism is model-agnostic, but the
+evaluation above is at 1.5B. We therefore repeat a needle probe at **7B** (Qwen2.5-7B-
+Instruct-AWQ, 4-bit Marlin, single RTX 5070) and at **TP=2** (2×RTX 5070,
+`VLLM_ENABLE_V1_MULTIPROCESSING=1`, `async_scheduling=False`). With 2 048-token haystacks ×
+5 depths × 3 samples, the no-eviction reference and eviction at keep-10% both hit **15/15**
+at TP=1 and **15/15** at TP=2; the engine logs real release (`prompt_nblk=120 → keep=10,
+freed=110`) and both ranks report the same retained set. This run's purpose is structural,
+not statistical: 7B/TP=2 is where the cross-rank importance reduction and the worker→engine
+retained-set hand-off are actually exercised, and the outcome matches TP=1 exactly. The
+needle probe is saturated at this scale (as it already is at 1.5B, §5.6), so this is a
+*mechanism* check, not a 7B quality result — a 7B LongBench F1 run is required for that.
+
 **ZH 实验**：模型 Qwen2.5-1.5B，5 任务 × 30 样本，参考=同插件不驱逐（**所有数字在同一
 commit 上一次性重测，消除版本漂移**）。5.1 中性：passthrough 与原生逐字一致；不驱逐的打分
 本身翻转 ~7% 贪心 token（确定性），故弃用贪心指标。5.2 结构化对比：位置式几乎总是分歧
@@ -292,6 +317,12 @@ TRITON_ATTN 下驱逐真实且确定。5.5 吞吐（容量受限 + decode 为主
 0.2391，keep50 0.2299，keep30 0.2531，位置式 0.1655。**与分布指标一致：块级近无损，位置式
 显著掉分。** 5.7 query-agnostic（KVzip 式，compress 先于问题）：div_rate 0.400 vs
 query-aware 0.193 → 明显更差，与文献中 query 可见性影响大的结论一致；其价值在可复用而非精度。
+5.8 规模与张量并行：机制与规模无关，但上文评测在 1.5B。在 7B（AWQ 4-bit Marlin，单卡）与
+TP=2（双卡，multiprocessing=1 + async_scheduling=False）上重跑针测：2048-token × 5 深度 ×
+3 样本，基线与 keep-10% 在 TP=1、TP=2 下**均 15/15**；engine 确有物理释放（120 块→留 10、
+释放 110），两 rank 保留集一致。意义是结构性的——TP>1 才真正压测跨 rank 归约与
+worker→engine 回传，结果与 TP=1 完全一致。针测在该规模已饱和，故这只是**机制验证**；
+7B 的精度结论仍需 7B LongBench F1。
 
 ### Tables
 
@@ -353,19 +384,22 @@ query-aware 0.193 → 明显更差，与文献中 query 可见性影响大的结
 
 ## 6. Limitations and Future Work
 
-- **Scale.** One 1.5B model; no larger models. LongBench F1 deltas are within noise at
+- **Scale.** The *quality* evaluation (LongBench F1, throughput) is at 1.5B only. At 7B we
+  validated the mechanism at TP=1 and TP=2 (§5.8), but the needle probe is saturated there,
+  so no 7B quality claim is made. LongBench F1 deltas are within noise at
   n=300 (SE≈0.023), so "lossless" here means *not distinguishable from no eviction* at
   this sample size, not an equivalence proof. Throughput gains appear only in a
   capacity-bound, decode-heavy regime; prefill-dominated workloads show none (eviction
   saves memory, not prefill compute).
 - **Metric.** Distribution distance measures deviation from no-eviction, not task
   correctness; a large KL may still be a valid alternative continuation.
-- **Deployment scope (now enforced at startup).** The plugin requires a single process
-  (`VLLM_ENABLE_V1_MULTIPROCESSING=0`), TP=PP=1, and CUDA graphs disabled; each is
-  checked and fails loudly with a remediation message. `async_scheduling` — on by
-  default in vLLM 0.28 — is warned about rather than blocked, because our experiments
-  ran correctly and deterministically under it in single-process mode. Multi-KV-group
-  models remain untested.
+- **Deployment scope (now enforced at startup).** CUDA graphs must be disabled and PP>1 is
+  not supported. TP=1 requires a single process (`VLLM_ENABLE_V1_MULTIPROCESSING=0`); TP>1
+  is supported and requires `async_scheduling=False` (the worker→engine hand-off is
+  step-aligned). Each condition is checked and fails loudly with a remediation message.
+  `async_scheduling` — on by default in vLLM 0.28 — is warned about rather than blocked at
+  TP=1, because our experiments ran correctly and deterministically under it in
+  single-process mode. Multi-KV-group models remain untested.
 - **Prefix caching.** Blocks shared via the prefix cache are ref-counted; our early free
   decrements the request's reference. Single-config tests pass, but the accounting under
   interleaved multi-request sharing needs proof.
@@ -405,4 +439,15 @@ PE_MODE=chunkkv PE_BACKEND=TRITON_ATTN PE_RATIO=0.5 PE_OBS=16 PE_N=30 \
   PE_TAG=evict python -m bench.p3_metric
 # compare
 PE_REF_TAG=ref PE_TAG=evict python -m bench.p3_metric compare
+```
+
+```bash
+# --- model scale / tensor parallelism (§5.8; needle probe, saturated) ---
+export LD_LIBRARY_PATH=/hy-tmp/vllm-build/lib/python3.11/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
+# TP=1 (single-process):
+VLLM_ENABLE_V1_MULTIPROCESSING=0 CUDA_VISIBLE_DEVICES=1 \
+  PE_MODEL=/root/models/Qwen2.5-7B-Instruct-AWQ PE_GMEM=0.6 PE_TARGET=2048 \
+  PE_PER_DEPTH=3 PE_BACKEND=TRITON_ATTN PE_MODE=chunkkv PE_RATIO=0.1 \
+  python -m bench.p3_needle_bench
+# TP=2 (add): CUDA_VISIBLE_DEVICES=0,1 PE_TP=2 PE_ASYNC=0 VLLM_ENABLE_V1_MULTIPROCESSING=1
 ```
