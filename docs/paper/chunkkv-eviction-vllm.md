@@ -243,7 +243,8 @@ TP>1 下 worker 是独立 spawn 进程，§3.2 的进程内 rendezvous 不再适
 
 **Setup.** Qwen2.5-1.5B-Instruct (28 layers, 2 KV heads, head dim 128, block 16) on
 2×RTX 5070; 5 LongBench tasks × 30 samples; reference = the same plugin with no eviction
-(`budget ≥ prompt`). Metric §3.6.
+(`budget ≥ prompt`). Metric §3.6. A 7B (Qwen2.5-7B-Instruct-AWQ) scale/TP=2 run is
+reported separately in §5.8.
 
 **5.1 Neutrality / isolation.** `passthrough` = divergence 0 vs vanilla. No-eviction
 scoring shifts ≈7% of greedy tokens but is deterministic run-to-run — the reason we
@@ -303,7 +304,15 @@ freed=110`) and both ranks report the same retained set. This run's purpose is s
 not statistical: 7B/TP=2 is where the cross-rank importance reduction and the worker→engine
 retained-set hand-off are actually exercised, and the outcome matches TP=1 exactly. The
 needle probe is saturated at this scale (as it already is at 1.5B, §5.6), so this is a
-*mechanism* check, not a 7B quality result — a 7B LongBench F1 run is required for that.
+*mechanism* check. We additionally run the LongBench F1 harness at 7B (same 5 tasks × 60
+samples, N=60/task): no eviction **0.1885**, keep-50% **0.1855 (−0.0030)**, keep-20%
+**0.1773 (−0.0112)**. With the unpaired noise scale SE≈0.023 (n=300), the 50% delta is
+≈0.13 SE and the 20% delta ≈0.5 SE — i.e. **the 7B result reproduces the 1.5B finding:
+near-lossless at 50% retention, small degradation as retention tightens**. Caveat: the
+*absolute* 7B level is below the 1.5B reference (0.1885 vs 0.2391) because this harness
+caps generation at 32 tokens and truncates context to 20k characters, and the weights are
+4-bit AWQ; the eviction deltas are therefore same-model, same-prompt differences and the
+absolute level should not be read as a 7B-vs-1.5B comparison.
 
 **ZH 实验**：模型 Qwen2.5-1.5B，5 任务 × 30 样本，参考=同插件不驱逐（**所有数字在同一
 commit 上一次性重测，消除版本漂移**）。5.1 中性：passthrough 与原生逐字一致；不驱逐的打分
@@ -321,8 +330,13 @@ query-aware 0.193 → 明显更差，与文献中 query 可见性影响大的结
 TP=2（双卡，multiprocessing=1 + async_scheduling=False）上重跑针测：2048-token × 5 深度 ×
 3 样本，基线与 keep-10% 在 TP=1、TP=2 下**均 15/15**；engine 确有物理释放（120 块→留 10、
 释放 110），两 rank 保留集一致。意义是结构性的——TP>1 才真正压测跨 rank 归约与
-worker→engine 回传，结果与 TP=1 完全一致。针测在该规模已饱和，故这只是**机制验证**；
-7B 的精度结论仍需 7B LongBench F1。
+worker→engine 回传，结果与 TP=1 完全一致。针测在该规模已饱和，故那只是**机制验证**。另在
+7B 上跑 LongBench F1（同 5 任务 × 60，N=60/任务）：不驱逐 **0.1885**、keep50 **0.1855
+（−0.0030）**、keep20 **0.1773（−0.0112）**；以非配对噪声尺度 SE≈0.023（n=300）计，前者仅
+0.13 SE、后者 ≈0.5 SE → **7B 复现了 1.5B 的结论：50% 保留近无损，压缩越紧退化越明显**。
+注意 7B 的**绝对** F1 低于 1.5B 参考（0.1885 vs 0.2391），因该 harness 限 32 输出 token、
+上下文截断到 20k 字符、且权重是 4-bit AWQ；因此驱逐增益按**同模型同 prompt 的差值**解读，
+不能当作 7B vs 1.5B 的绝对对比。
 
 ### Tables
 
@@ -384,9 +398,11 @@ worker→engine 回传，结果与 TP=1 完全一致。针测在该规模已饱�
 
 ## 6. Limitations and Future Work
 
-- **Scale.** The *quality* evaluation (LongBench F1, throughput) is at 1.5B only. At 7B we
-  validated the mechanism at TP=1 and TP=2 (§5.8), but the needle probe is saturated there,
-  so no 7B quality claim is made. LongBench F1 deltas are within noise at
+- **Scale.** Throughput is measured at 1.5B only. At 7B (4-bit AWQ) we validate the
+  mechanism at TP=1 and TP=2 *and* reproduce the task-accuracy finding (keep-50% −0.003,
+  keep-20% −0.011; n=300, SE≈0.023) — but the 7B run uses a saturated needle probe and a
+  32-token generation cap that depresses its absolute level, and there is no 7B throughput
+  or 7B paired-bootstrap result (§5.8). LongBench F1 deltas are within noise at
   n=300 (SE≈0.023), so "lossless" here means *not distinguishable from no eviction* at
   this sample size, not an equivalence proof. Throughput gains appear only in a
   capacity-bound, decode-heavy regime; prefill-dominated workloads show none (eviction
