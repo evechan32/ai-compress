@@ -16,8 +16,8 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL = "/models/qwen2.5-1.5b-instruct"
-S = 512
+MODEL = os.environ.get("PE_MODEL", "/models/qwen2.5-1.5b-instruct")
+S = int(os.environ.get("PE_S", "512"))
 FILLER = "The harbor master logged every vessel that passed the north pier. "
 NEEDLE = " IMPORTANT: the secret vault code is K7XQ21. "
 
