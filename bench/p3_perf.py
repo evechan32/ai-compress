@@ -39,14 +39,15 @@ def main():
     m = int(os.environ.get("PE_M", "64"))
     t = int(os.environ.get("PE_MAXNEW", "32"))
     llm = LLM(
-        model="/models/qwen2.5-1.5b-instruct",
-        max_model_len=8192,
-        gpu_memory_utilization=0.6,
+        model=os.environ.get("PE_MODEL", "/models/qwen2.5-1.5b-instruct"),
+        max_model_len=int(os.environ.get("PE_MAXLEN", "8192")),
+        gpu_memory_utilization=float(os.environ.get("PE_GMEM", "0.6")),
         enforce_eager=True,
         max_num_seqs=m,
         disable_log_stats=True,
         enable_prefix_caching=False,
         attention_backend=os.environ.get("PE_BACKEND") or None,
+        tensor_parallel_size=int(os.environ.get("PE_TP", "1")),
     )
     prompts = make_prompts(llm.get_tokenizer(), m)
     sp = SamplingParams(max_tokens=t, temperature=0.0)
@@ -58,7 +59,8 @@ def main():
           f"out_tokens={out_tokens} tok_per_s={out_tokens / wall:.1f}", flush=True)
     json.dump({"mode": mode, "M": m, "T": t, "wall": wall,
                "out_tokens": out_tokens, "tok_per_s": out_tokens / wall},
-              open(f"/root/ai-compress/bench/out/perf-{mode or 'off'}.json", "w"))
+              open(f"/root/ai-compress/bench/out/perf-{mode or 'off'}"
+                   f"-{os.environ.get('PE_RATIO','1')}.json", "w"))
 
 
 if __name__ == "__main__":
