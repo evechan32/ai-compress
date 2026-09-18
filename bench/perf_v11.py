@@ -34,8 +34,8 @@ def make_prompts(tok, m, words):
     for i in range(m):
         rng = random.Random(1000 + i)
         body = " ".join(rng.choice(WORDS) for _ in range(words))
-        out.append(f"Read the document.\n\n{body}\n\nQuestion: What themes "
-                   f"recur? (doc {i})\nAnswer:")
+        out.append(f"Read the document.\n\n{body}\n\n"
+                   f"Continue the document verbatim, do not stop, doc {i}:")
     return out
 
 
