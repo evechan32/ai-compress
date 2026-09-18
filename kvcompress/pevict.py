@@ -1,14 +1,11 @@
-"""Prompt 侧分块 KV 驱逐。
+"""vLLM 0.28 版本（CUDA 13 环境）。
 
-模式（PE_MODE）：
-- off      : 旁路
-- position : 位置式 sink+window（复用 R-SWA 掩码，真实物理释放）
-- free     : 只释放块、不加掩码（诊断用）
-- chunkkv  : 注意力打分选块（ChunkKV 式）+ 自定义 backend 压实 block_table
-
-chunkkv 不打 R-SWA 掩码，而是由自定义 metadata builder 把被驱逐块从
-attention 的 block_table 压掉并缩小 seq_lens，kernel 只 gather 保留 KV；
-KV 写入仍走 slot_mapping，不受影响。
+⚠️ 本文件仅适用于 **vLLM 0.28（依赖 cu13，需驱动 >= 580）**。
+在 CUDA 12.x / 旧驱动（如驱动 530）环境下请用 **`kvcompress/pevict_v11.py`**
+（vLLM 0.11.2 端口）—— 它是当前主力实现，且比本文件多一项能力：
+**生成段窗口**（每 decode 步释放超窗生成块）。实测在容量受限形状下，
+生成段窗口把"仅 prompt 驱逐"的净亏翻成 **+60% 吞吐**（详见
+docs/v11-port-status.md）。本文件不做生成段驱逐，故长生成下 KV 无界。
 """
 from __future__ import annotations
 
