@@ -58,10 +58,6 @@ _VER: int = 0
 _BUILT_VER: int = -1
 # 同一 decode 步内所有 attention 层共享同一份 common_attn_metadata 对象
 # → 用它做键，把压实从「每层一次」降到「每步一次」。持有强引用防止 id 复用。
-_CAM = None
-_CAM_BT = None
-_CAM_SL = None
-_CAM_MAXSL = 0
 _PROMPT_DONE: set = set()
 # 生成段窗口：记录每个请求「已释放到哪个块下标」，避免每步从头重扫
 _GEN_FROM: dict = {}
@@ -71,6 +67,11 @@ _GW_DBG: list = [0]
 # 故不能靠 null 检测，必须由 manager 记录）
 _DROP: dict = {}
 _DROP_T: dict = {}
+# 同一 decode 步内所有层共享同一份 common_attn_metadata 对象 → 压实每步只做一次
+# （持强引用防止 id 被回收后复用）
+_CAM = None
+_CAM_BT = None
+_CAM_SL = None
 _MD_NONE: int = 0
 _MD_OK: int = 0
 
@@ -453,15 +454,16 @@ def _build_backend(torch):
     class PromptEvictBuilder(TritonAttentionMetadataBuilder):
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+            global _CAM, _CAM_BT, _CAM_SL
+            cam = common_attn_metadata
+            if _CAM is cam and _CAM_BT is not None:
+                md.block_table, md.seq_lens = _CAM_BT, _CAM_SL
+                return md
+            _CAM, _CAM_BT, _CAM_SL = cam, None, None
             gw = int(_CFG.get("gen_window", 0) or 0)
             if not _DROP and gw == 0 and not int(_CFG.get("force_sl", 0) or 0):
                 return md
             if int(_CFG.get("no_compact", 0) or 0):
-                return md
-            global _CAM, _CAM_BT, _CAM_SL, _CAM_MAXSL
-            if gw > 0 and _CAM is common_attn_metadata and _CAM_BT is not None:
-                md.block_table, md.seq_lens = _CAM_BT, _CAM_SL
-                md.max_seq_len = _CAM_MAXSL
                 return md
             bt, sl = getattr(md, "block_table", None), getattr(md, "seq_lens", None)
             if bt is None or sl is None or bt.numel() == 0:
@@ -497,6 +499,7 @@ def _build_backend(torch):
                 md.max_seq_len = int(new_sl.max().item())
             except Exception:
                 pass
+            _CAM_BT, _CAM_SL = new_bt, new_sl
             return md
 
     class PromptEvictBackend(TritonAttentionBackend):
