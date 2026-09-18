@@ -37,6 +37,7 @@ def main():
     ap.add_argument("--max-ctx-chars", type=int, default=20000)
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--dump-text", action="store_true")
     ap.add_argument("--out", default="/root/f1-out")
     args = ap.parse_args()
 
@@ -62,6 +63,9 @@ def main():
                for o, r in zip(outs, rows)]
         res[fn] = {"f1": f1s, "mean": round(sum(f1s) / max(1, len(f1s)), 4),
                    "n": len(f1s)}
+        if args.dump_text:
+            res[fn]["text"] = [o.outputs[0].text for o in outs]
+            res[fn]["ids"] = [list(o.outputs[0].token_ids) for o in outs]
         print(f"[F1-11] {fn:<22} n={len(f1s)} mean={res[fn]['mean']}", flush=True)
     os.makedirs(args.out, exist_ok=True)
     rec = {"tag": args.tag, "mode": mode, "ratio": os.environ.get("PE_RATIO", "1"),
