@@ -38,6 +38,7 @@ _DEFAULTS = {
     "gen_window": int(os.environ.get("PE_GEN_WINDOW", "0")),
     # 仅用于性能隔离实验：置 1 时跳过压实（结果不正确，只用于计时）
     "no_compact": int(os.environ.get("PE_NO_COMPACT", "0")),
+    "force_sl": int(os.environ.get("PE_FORCE_SL", "0")),
     "rope_theta": float(os.environ.get("PE_ROPE_THETA", "1e6")),
     "n_future": int(os.environ.get("PE_N_FUTURE", "512")),
 }
@@ -414,6 +415,16 @@ def _build_backend(torch):
                     _MD_OK += 1
             except Exception:
                 pass
+            if (_LOG and _layer_idx(layer) == _MAX_LAYER
+                    and _GW_DBG[0] < 8 and attn_metadata is not None):
+                _GW_DBG[0] += 1
+                try:
+                    bt = attn_metadata.block_table
+                    print(f"[PE11] idbg li={_layer_idx(layer)} bt0_nz={int((bt[0] != 0).sum())} "
+                          f"seq0={int(attn_metadata.seq_lens[0])} bt0={bt[0,:6].tolist()}",
+                          flush=True)
+                except Exception as e:
+                    print("[PE11] idbg err", type(e).__name__, str(e)[:50], flush=True)
             if _LOG and (_MD_NONE + _MD_OK) % 400 == 0 and (_MD_NONE + _MD_OK) > 0:
                 print(f"[PE11] mdcnt none={_MD_NONE} ok={_MD_OK} li={_layer_idx(layer)} "
                       f"has_bt={None if attn_metadata is None else hasattr(attn_metadata, 'block_table')}",
@@ -430,15 +441,11 @@ def _build_backend(torch):
     class PromptEvictBuilder(TritonAttentionMetadataBuilder):
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             md = super().build(common_prefix_len, common_attn_metadata, fast_build)
-            global _BUILT_VER
             gw = int(_CFG.get("gen_window", 0) or 0)
-            if not _RETAINED and gw == 0:
+            if not _DROP and gw == 0 and not int(_CFG.get("force_sl", 0) or 0):
                 return md
             if int(_CFG.get("no_compact", 0) or 0):
                 return md
-            if gw == 0 and _BUILT_VER == _VER:
-                return md
-            _BUILT_VER = _VER
             global _CAM, _CAM_BT, _CAM_SL, _CAM_MAXSL
             if gw > 0 and _CAM is common_attn_metadata and _CAM_BT is not None:
                 md.block_table, md.seq_lens = _CAM_BT, _CAM_SL
@@ -476,6 +483,10 @@ def _build_backend(torch):
                 print(f"[PE11] bdbg ndrop={len(_DROP)} rid0={rid0} "
                       f"dropped0={None if rid0 is None else len(_DROP.get(rid0) or ())} "
                       f"changed={changed} nrow={sl.shape[0]} sl0={int(sl[0])}", flush=True)
+            fs = int(_CFG.get("force_sl", 0) or 0)
+            if fs > 0:
+                new_sl = torch.full_like(new_sl, fs)
+                changed = True
             if changed:
                 md.block_table, md.seq_lens = new_bt, new_sl
                 try:
