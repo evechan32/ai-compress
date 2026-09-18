@@ -39,6 +39,8 @@ _DEFAULTS = {
     # 仅用于性能隔离实验：置 1 时跳过压实（结果不正确，只用于计时）
     "no_compact": int(os.environ.get("PE_NO_COMPACT", "0")),
     "force_sl": int(os.environ.get("PE_FORCE_SL", "0")),
+    # 释放时机实验：只在 prefill 之后再过 N 个 token 才真正释放（同一保留集）
+    "release_delay": int(os.environ.get("PE_RELEASE_DELAY", "0")),
     "rope_theta": float(os.environ.get("PE_ROPE_THETA", "1e6")),
     "n_future": int(os.environ.get("PE_N_FUTURE", "512")),
 }
@@ -303,7 +305,9 @@ def _make_manager_cls():
             if blocks and plen is not None:
                 bs = self.block_size
                 pnb = (plen + bs - 1) // bs
-                if num_computed_tokens >= plen and request_id not in _PROMPT_DONE:
+                delay = int(_CFG.get("release_delay", 0) or 0)
+                if (num_computed_tokens >= plen + delay
+                        and request_id not in _PROMPT_DONE):
                     _PROMPT_DONE.add(request_id)
                     if _MODE == "chunkkv":
                         ent = _RETAINED.get(request_id)
