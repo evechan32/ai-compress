@@ -41,6 +41,10 @@ _DEFAULTS = {
     "force_sl": int(os.environ.get("PE_FORCE_SL", "0")),
     # 释放时机实验：只在 prefill 之后再过 N 个 token 才真正释放（同一保留集）
     "release_delay": int(os.environ.get("PE_RELEASE_DELAY", "0")),
+    # prefill 中途驱逐：query-free 逐 chunk 打分并渐进释放（降峰值）
+    "midprefill": int(os.environ.get("PE_MIDPREFILL", "0")),
+    "mid_sink": int(os.environ.get("PE_MID_SINK", "32")),
+    "mid_window": int(os.environ.get("PE_MID_WINDOW", "16")),
     "rope_theta": float(os.environ.get("PE_ROPE_THETA", "1e6")),
     "n_future": int(os.environ.get("PE_N_FUTURE", "512")),
 }
@@ -67,6 +71,9 @@ _NULL_ID: list = [None]
 # 故不能靠 null 检测，必须由 manager 记录）
 _DROP: dict = {}
 _DROP_T: dict = {}
+_MID_SCORE: dict = {}
+_PEAK_FREE: list = [None]
+_PEAK_NOTE: list = [0]
 # 同一 decode 步内所有层共享同一份 common_attn_metadata 对象 → 压实每步只做一次
 # （持强引用防止 id 被回收后复用）
 _CAM = None
@@ -169,7 +176,7 @@ def _expected_imp(buf, k_all, kv_cache, blk, nblk, bs, Hq, Hkv, D, rep, cfg):
     return p_grp.mean(dim=1)
 
 
-def _score_from_cache(layer, query, key, kv_cache, md) -> None:
+def _score_from_cache(layer, query, key, value, kv_cache, md) -> None:
     """从 KV 池 gather 全序列 K 后打分（支持 chunked prefill + 多层投票）。
 
     prompt 长度来自 _PROMPT_LEN（0.11.2 无 rswa_prefix_lens）；
@@ -209,6 +216,28 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
             continue
         qs, qe = qsl[r], qsl[r + 1]
         bkey = (li, req_id)
+        if int(cfg.get("midprefill", 0) or 0):
+            if li != _MAX_LAYER or key is None or value is None:
+                continue
+            qlen = qe - qs
+            st = L - qlen
+            if qlen <= 0 or st < 0:
+                continue
+            kf = key[qs:qe].float()
+            vf = value[qs:qe].float()
+            sc = (kf * kf).sum(-1).mean(-1) * (vf * vf).sum(-1).mean(-1)
+            buf = _MID_SCORE.get(req_id)
+            if buf is None or buf.numel() < L:
+                pad = torch.zeros(L - (0 if buf is None else buf.numel()),
+                                  device=sc.device)
+                buf = pad if buf is None else torch.cat([buf, pad])
+            buf[st:L] = sc
+            _MID_SCORE[req_id] = buf
+            mcfg = dict(cfg)
+            mcfg["obs"] = int(cfg.get("mid_window", 16)) * bs
+            mcfg["sink"] = int(cfg.get("mid_sink", 32))
+            _select_blocks(buf[:L], L, bs, mcfg, req_id)
+            continue
         if L <= plen:
             if _Q_LASTL.get(bkey) != L:
                 _Q_LASTL[bkey] = L
@@ -306,8 +335,11 @@ def _make_manager_cls():
                 bs = self.block_size
                 pnb = (plen + bs - 1) // bs
                 delay = int(_CFG.get("release_delay", 0) or 0)
-                if (num_computed_tokens >= plen + delay
-                        and request_id not in _PROMPT_DONE):
+                mid = int(_CFG.get("midprefill", 0) or 0)
+                gate = (mid and request_id in _RETAINED) or (
+                    num_computed_tokens >= plen + delay
+                    and request_id not in _PROMPT_DONE)
+                if gate:
                     _PROMPT_DONE.add(request_id)
                     if _MODE == "chunkkv":
                         ent = _RETAINED.get(request_id)
@@ -353,6 +385,7 @@ def _make_manager_cls():
             _GEN_FROM.pop(request_id, None)
             _DROP.pop(request_id, None)
             _DROP_T.pop(request_id, None)
+            _MID_SCORE.pop(request_id, None)
             _RETAINED.pop(request_id, None)
             _IMP_ACC.pop(request_id, None)
             _VOTES.pop(request_id, None)
@@ -409,7 +442,8 @@ def _build_backend(torch):
                                   attn_metadata, output, *args, **kwargs)
             if _MODE == "chunkkv" and attn_metadata is not None:
                 try:
-                    _score_from_cache(layer, query, key, kv_cache, attn_metadata)
+                    _score_from_cache(layer, query, key, value, kv_cache,
+                                      attn_metadata)
                 except Exception as e:
                     print("[PE11] score warn:", type(e).__name__, str(e)[:160], flush=True)
             return out
@@ -482,8 +516,17 @@ def _build_backend(torch):
     return PromptEvictBackend
 
 
+def _report_peak() -> None:
+    if _PEAK_FREE[0] is not None:
+        print(f"[PE11] peak_min_free_blocks={_PEAK_FREE[0]}", flush=True)
+
+
 def install(params=None) -> None:
     import torch
+    import atexit
+    if not _PEAK_NOTE[0]:
+        _PEAK_NOTE[0] = True
+        atexit.register(_report_peak)
 
     pe_params = dict(_DEFAULTS)
     if params:
