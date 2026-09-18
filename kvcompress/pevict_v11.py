@@ -51,6 +51,8 @@ _IMP_ACC: dict = {}
 _VOTES: dict = {}
 _LAYER_SEEN: set = set()
 _DBG_SEEN: set = set()
+_VER: int = 0
+_BUILT_VER: int = -1
 _PROMPT_DONE: set = set()
 
 
@@ -108,6 +110,8 @@ def _select_blocks(imp, L, bs, cfg, req_id):
     wb = (int(cfg["obs"]) + bs - 1) // bs
     keep.update(range(max(0, nblk - wb), nblk))
     _RETAINED[req_id] = (nblk, tuple(sorted(keep)))
+    global _VER
+    _VER += 1
     return nblk, keep
 
 
@@ -169,6 +173,9 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
         return
     k_vote = max(1, int(cfg.get("vote_layers", 1) or 1))
     if li < _MAX_LAYER - k_vote + 1:
+        return
+    live = [r for r in _REQ_IDS if r is not None]
+    if live and all(r in _RETAINED for r in live):
         return
     qsl = md.query_start_loc.tolist()
     seqlens = md.seq_lens.tolist()
@@ -381,9 +388,13 @@ def _build_backend(torch):
     class PromptEvictBuilder(TritonAttentionMetadataBuilder):
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+            global _BUILT_VER
             gw = int(_CFG.get("gen_window", 0) or 0)
             if not _RETAINED and gw == 0:
                 return md
+            if gw == 0 and _BUILT_VER == _VER:
+                return md
+            _BUILT_VER = _VER
             bt, sl = getattr(md, "block_table", None), getattr(md, "seq_lens", None)
             if bt is None or sl is None or bt.numel() == 0:
                 return md
