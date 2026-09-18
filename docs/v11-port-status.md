@@ -67,3 +67,35 @@ export PE_SINK=0 PE_OBS=32 PE_WIN_AGG=max
 PE_MODE=chunkkv PE_RATIO=0.3 PE_GEN_WINDOW=0 \
   python3 bench/perf_v11.py --m 64 --prompt-words 576 --gen 1500 --gmem 0.30 --tag x
 ```
+
+## 五、生成段窗口的真实收益（容量受限形状）★ 关键结果
+
+前面的长生成测试用 M=64，**根本不是容量受限**（64×1846 ≈ 118k token，池子约 122k → 刚好装下），
+所以只看得到开销。把并发加到 **M=256** 后形状才真正容量受限：
+
+| 配置（M=256, prompt≈1152, gen=1500, gmem=0.30） | tok/s | vs off |
+|---|---|---|
+| `off` | 2475 | 1.00× |
+| `chunkkv@0.3, gw=0`（仅 prompt 驱逐） | 2408 | 0.97× |
+| **`chunkkv@0.3, gw=256`（+ 生成段窗口）** | **4012** | **1.62×** |
+
+**结论**：
+1. **仅压 prompt 段在长生成形状下毫无收益（0.97×）** —— 因为长生成时 KV 主体在生成段。
+2. **加上生成段窗口后 1.62×** —— 生成 KV 被界在 256 而非 1500（−83%），
+   释放出的容量直接兑换成并发 → 吞吐 +62%。
+3. 这比 0.28 上最好的结果（keep-30% 的 1.26×）还高，且是**新能力**（0.28 的 chunkkv 模式不压生成段）。
+4. 用户"既然压了就压生成段"的判断被实测证实。
+
+### 复现
+
+```bash
+export PE_SINK=0 PE_OBS=32 PE_WIN_AGG=max PE_RATIO=0.3
+PE_MODE=chunkkv PE_GEN_WINDOW=256 \
+  python3 bench/perf_v11.py --m 256 --prompt-words 576 --gen 1500 --gmem 0.30 --tag x
+```
+
+### 注意
+
+- `PE_GEN_WINDOW` 的收益**只在容量受限形状下出现**（大并发 + 长生成）。
+  在非容量受限形状下它只贡献开销（压实是每步的），故非受限场景可设 0。
+- 压实已全向量化（掩码 + stable argsort），逐行 Python 循环与 H2D 已移除。
