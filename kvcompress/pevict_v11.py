@@ -53,7 +53,15 @@ _LAYER_SEEN: set = set()
 _DBG_SEEN: set = set()
 _VER: int = 0
 _BUILT_VER: int = -1
+# 同一 decode 步内所有 attention 层共享同一份 common_attn_metadata 对象
+# → 用它做键，把压实从「每层一次」降到「每步一次」。持有强引用防止 id 复用。
+_CAM = None
+_CAM_BT = None
+_CAM_SL = None
+_CAM_MAXSL = 0
 _PROMPT_DONE: set = set()
+# 生成段窗口：记录每个请求「已释放到哪个块下标」，避免每步从头重扫
+_GEN_FROM: dict = {}
 
 
 def _layer_idx(layer) -> int:
@@ -312,9 +320,11 @@ def _make_manager_cls():
                     nblk_now = (num_computed_tokens + bs - 1) // bs
                     keep_from = max(pnb, (num_computed_tokens - gw) // bs)
                     tail = min(keep_from, len(blocks))
-                    if pnb < tail:
+                    start = max(pnb, _GEN_FROM.get(request_id, pnb))
+                    if start < tail:
+                        _GEN_FROM[request_id] = tail
                         before = self.block_pool.get_num_free_blocks()
-                        n = self._free_idx(request_id, range(pnb, tail))
+                        n = self._free_idx(request_id, range(start, tail))
                         if _LOG and n:
                             print(f"[PE11] evict genwin req={request_id} "
                                   f"blk[{pnb},{tail}) nblk={nblk_now} freed={n} pool {before}->"
@@ -324,6 +334,7 @@ def _make_manager_cls():
         def free(self, request_id):
             _PROMPT_LEN.pop(request_id, None)
             _PROMPT_DONE.discard(request_id)
+            _GEN_FROM.pop(request_id, None)
             _RETAINED.pop(request_id, None)
             _IMP_ACC.pop(request_id, None)
             _VOTES.pop(request_id, None)
@@ -395,6 +406,11 @@ def _build_backend(torch):
             if gw == 0 and _BUILT_VER == _VER:
                 return md
             _BUILT_VER = _VER
+            global _CAM, _CAM_BT, _CAM_SL, _CAM_MAXSL
+            if gw > 0 and _CAM is common_attn_metadata and _CAM_BT is not None:
+                md.block_table, md.seq_lens = _CAM_BT, _CAM_SL
+                md.max_seq_len = _CAM_MAXSL
+                return md
             bt, sl = getattr(md, "block_table", None), getattr(md, "seq_lens", None)
             if bt is None or sl is None or bt.numel() == 0:
                 return md
@@ -433,6 +449,8 @@ def _build_backend(torch):
                     md.max_seq_len = int(new_sl.max().item())
                 except Exception:
                     pass
+                _CAM, _CAM_BT, _CAM_SL = common_attn_metadata, new_bt, new_sl
+                _CAM_MAXSL = md.max_seq_len
             return md
 
     class PromptEvictBackend(TritonAttentionBackend):

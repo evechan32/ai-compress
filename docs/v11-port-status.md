@@ -36,10 +36,19 @@ Builder 加保留集版本缓存（`gen_window=0` 时不再每层每步重复压
 
 **已排除**：不是"压实被每层重复执行"（加了"每步只压一次"的缓存，0.58× → 0.59×，无改善）。
 
-**剩余怀疑（未验证）**：
-1. manager 每步重扫 `[prompt_nblk, tail)` 释放区间（`tail` 随生成增长 → 每步 O(已生成块数) 次 Python 迭代）
-2. `seq_lens` 每步变化 → 注意力 kernel 走慢路径或重新编译/autotune
-3. 释放的块立即被新 token 复用 → 块池频繁回收/再分配的串行化
+**已排除的两个假设**（各自单独实测，均无改善）：
+1. ❌ "压实被每个 attention 层重复执行" → 加"每步只压一次"缓存（按 common_attn_metadata
+   对象做键 + 持强引用防 id 复用）：0.58× → 0.59×
+2. ❌ "manager 每步重扫 `[pnb, tail)` 释放区间" → 改为记录 `_GEN_FROM` 只扫新增块：
+   0.59× → 0.56×
+
+**剩余怀疑（未验证，需 profiler）**：
+1. `seq_lens` / `block_table` 每步变化 → 注意力 kernel 走慢路径或重新 autotune
+2. 释放的块被新 token 立即复用 → 块池回收/再分配串行化
+3. 压实时把 block_table 尾部写 0，可能被 kernel 当作合法块 0 而多做工作
+
+**方法学教训**：这一步已经连续两次"猜成因 → 改 → 无改善"。继续盲猜是浪费 GPU 预算，
+应当改用 torch profiler / nsys 直接看 time breakdown 再动手。
 
 ## 三、结论与建议
 
