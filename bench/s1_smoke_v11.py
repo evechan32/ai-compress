@@ -30,8 +30,12 @@ def main():
     ntok = len(llm.get_tokenizer().encode(prompt))
     cap = os.environ.get("PE_MAXNEW", "400")
     o = llm.generate([prompt], SamplingParams(max_tokens=int(cap), temperature=0))
+    import hashlib
     text = o[0].outputs[0].text
-    print(f"S1 mode={MODE} prompt_tokens={ntok} out={text[:110]!r}", flush=True)
+    h = hashlib.sha1(text.encode()).hexdigest()[:12]
+    toks = len(o[0].outputs[0].token_ids)
+    print(f"S1 mode={MODE} genwin={os.environ.get('PE_GEN_WINDOW','0')} "
+          f"prompt_tokens={ntok} out_tokens={toks} sha1={h} out={text[:70]!r}", flush=True)
 
 
 if __name__ == "__main__":

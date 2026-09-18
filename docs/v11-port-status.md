@@ -99,3 +99,47 @@ PE_MODE=chunkkv PE_GEN_WINDOW=256 \
 - `PE_GEN_WINDOW` 的收益**只在容量受限形状下出现**（大并发 + 长生成）。
   在非容量受限形状下它只贡献开销（压实是每步的），故非受限场景可设 0。
 - 压实已全向量化（掩码 + stable argsort），逐行 Python 循环与 H2D 已移除。
+
+---
+
+## 六、⚠️ 关键更正：驱逐尚未真正影响注意力（2026-09-18 发现）
+
+**前五节的性能数字建立在错误前提上，必须重新审视。**
+
+### 证据
+
+判据：同一次生成（prompt=1096, `max_new=256`，greedy）的**全文 sha1**：
+
+| 配置 | sha1 |
+|---|---|
+| `off` | `c3215d1dbb8e` |
+| `chunkkv@0.5`（释放 34/69 prompt 块） | `c3215d1dbb8e` |
+| `chunkkv@0.5 + genwin=64`（再释放生成块） | `c3215d1dbb8e` |
+
+**三者逐位相同** → 释放的块**仍被注意力读到**，压实没有作用到计算上。
+
+### 已排除的原因
+
+1. ❌ 不是"Null 检测失效" —— 诊断显示 metadata 的 block_table 里确实没有 null
+   （`nnull=187` 全是越界 0 填充），所以改为由 manager 记录 `_DROP` 下标集
+2. ❌ 不是"Builder 没跑" —— 日志确认 `changed=True dropped0=34 nrow=1`
+3. ❌ 不是"元数据为 None" —— 启动期 56 次 None 后，正常执行期全部有效且 `has_bt=True`
+
+### 当前判断
+
+**我们在 Builder 里改写 `md.block_table` / `md.seq_lens`，但没有到达注意力内核。**
+可能是 vLLM 0.11.2 在 `build()` 之后重新赋值这两个字段，或内核从别处读取。
+
+### 影响（重要）
+
+- **内存释放是真的**（`freed=N`、pool 增长、并发吞吐提升可复现）
+- 但**注意力仍在读被释放的块** → 单请求测试里这些块尚未被复用，所以输出看起来正常；
+  **在并发（如 M=256）下这些块会被其他请求复用 → 输出必然是垃圾**
+- ⇒ 第五节的 1.62× **不能作为有效结果**，必须先修好压实并重测
+- ⇒ 这也意味着 `PE_MODE=chunkkv` 在 0.11.2 端口上**当前不可用于正确性敏感场景**
+
+### 下一步（定位内核读取路径）
+
+1. 查 `TritonAttentionMetadataBuilder.build()` 之后，runner 是否重新赋值 `block_table`/`seq_lens`
+2. 查 Triton Impl/kernel 实际从哪个字段读块表（可能经 `get_forward_context()` 或缓存结构）
+3. 修好后再重跑：sha1 必须不同（证明生效）→ NIAH → 并发正确性 → 吞吐

@@ -65,6 +65,12 @@ _PROMPT_DONE: set = set()
 # 生成段窗口：记录每个请求「已释放到哪个块下标」，避免每步从头重扫
 _GEN_FROM: dict = {}
 _NULL_ID: list = [None]
+_GW_DBG: list = [0]
+# 每个请求被释放的块下标（metadata 的 block_table 不回读 req_to_blocks，
+# 故不能靠 null 检测，必须由 manager 记录）
+_DROP: dict = {}
+_MD_NONE: int = 0
+_MD_OK: int = 0
 
 
 def _layer_idx(layer) -> int:
@@ -280,6 +286,7 @@ def _make_manager_cls():
             if not blocks:
                 return 0
             n = 0
+            dropped = _DROP.setdefault(request_id, set())
             for i in idxs:
                 if i >= len(blocks) or blocks[i] == self._null_block:
                     continue
@@ -287,6 +294,7 @@ def _make_manager_cls():
                     _NULL_ID[0] = getattr(self._null_block, "block_id", None)
                 self.block_pool.free_blocks([blocks[i]])
                 blocks[i] = self._null_block
+                dropped.add(i)
                 n += 1
             return n
 
@@ -326,6 +334,11 @@ def _make_manager_cls():
                     keep_from = max(pnb, (num_computed_tokens - gw) // bs)
                     tail = min(keep_from, len(blocks))
                     start = max(pnb, _GEN_FROM.get(request_id, pnb))
+                    if _LOG and _GW_DBG[0] < 6:
+                        _GW_DBG[0] += 1
+                        print(f"[PE11] gwdbg L={num_computed_tokens} pnb={pnb} "
+                              f"keep_from={keep_from} tail={tail} start={start} "
+                              f"nblocks={len(blocks)}", flush=True)
                     if start < tail:
                         _GEN_FROM[request_id] = tail
                         before = self.block_pool.get_num_free_blocks()
@@ -340,6 +353,7 @@ def _make_manager_cls():
             _PROMPT_LEN.pop(request_id, None)
             _PROMPT_DONE.discard(request_id)
             _GEN_FROM.pop(request_id, None)
+            _DROP.pop(request_id, None)
             _RETAINED.pop(request_id, None)
             _IMP_ACC.pop(request_id, None)
             _VOTES.pop(request_id, None)
@@ -388,10 +402,22 @@ def _build_backend(torch):
     class PromptEvictImpl(TritonAttentionImpl):
         def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                     output, *args, **kwargs):
-            global _MAX_LAYER
+            global _MAX_LAYER, _MD_NONE, _MD_OK
             li = _layer_idx(layer)
             if li > _MAX_LAYER:
                 _MAX_LAYER = li
+            global _MD_NONE, _MD_OK
+            try:
+                if attn_metadata is None:
+                    _MD_NONE += 1
+                else:
+                    _MD_OK += 1
+            except Exception:
+                pass
+            if _LOG and (_MD_NONE + _MD_OK) % 400 == 0 and (_MD_NONE + _MD_OK) > 0:
+                print(f"[PE11] mdcnt none={_MD_NONE} ok={_MD_OK} li={_layer_idx(layer)} "
+                      f"has_bt={None if attn_metadata is None else hasattr(attn_metadata, 'block_table')}",
+                      flush=True)
             out = super().forward(layer, query, key, value, kv_cache,
                                   attn_metadata, output, *args, **kwargs)
             if _MODE == "chunkkv" and attn_metadata is not None:
@@ -421,26 +447,41 @@ def _build_backend(torch):
             bt, sl = getattr(md, "block_table", None), getattr(md, "seq_lens", None)
             if bt is None or sl is None or bt.numel() == 0:
                 return md
-            null_id = _NULL_ID[0]
-            if null_id is None:
-                return md
             bs = self.kv_cache_spec.block_size
-            cols = torch.arange(bt.shape[1], device=bt.device).unsqueeze(0)
-            nblk = ((sl + bs - 1) // bs).unsqueeze(1)
-            keep = (bt != null_id) & (cols < nblk)
-            if bool(keep.all()):
-                return md
-            order = torch.argsort(~keep, dim=1, stable=True)
-            new_bt = torch.gather(bt, 1, order)
-            cnt = keep.sum(dim=1, keepdim=True)
-            new_bt = torch.where(cols < cnt, new_bt, torch.zeros_like(new_bt))
-            per_blk = torch.clamp(sl.unsqueeze(1) - cols * bs, min=0, max=bs)
-            new_sl = (per_blk * keep).sum(dim=1).to(sl.dtype)
-            md.block_table, md.seq_lens = new_bt, new_sl
-            try:
-                md.max_seq_len = int(new_sl.max().item())
-            except Exception:
-                pass
+            new_bt, new_sl = bt.clone(), sl.clone()
+            changed = False
+            for r in range(sl.shape[0]):
+                req_id = _REQ_IDS[r] if r < len(_REQ_IDS) else None
+                if req_id is None:
+                    continue
+                dropped = _DROP.get(req_id)
+                if not dropped:
+                    continue
+                L = int(sl[r].item())
+                nblk = (L + bs - 1) // bs
+                idx = [i for i in range(nblk) if i not in dropped]
+                if len(idx) == nblk:
+                    continue
+                if idx:
+                    src = bt[r][torch.tensor(idx, device=bt.device, dtype=torch.long)]
+                    new_bt[r, :len(idx)] = src
+                    new_sl[r] = sum(min(bs, L - i * bs) for i in idx)
+                else:
+                    new_sl[r] = 0
+                new_bt[r, len(idx):] = 0
+                changed = True
+            if _LOG and _GW_DBG[0] < 14:
+                _GW_DBG[0] += 1
+                rid0 = _REQ_IDS[0] if _REQ_IDS else None
+                print(f"[PE11] bdbg ndrop={len(_DROP)} rid0={rid0} "
+                      f"dropped0={None if rid0 is None else len(_DROP.get(rid0) or ())} "
+                      f"changed={changed} nrow={sl.shape[0]} sl0={int(sl[0])}", flush=True)
+            if changed:
+                md.block_table, md.seq_lens = new_bt, new_sl
+                try:
+                    md.max_seq_len = int(new_sl.max().item())
+                except Exception:
+                    pass
             return md
 
     class PromptEvictBackend(TritonAttentionBackend):
