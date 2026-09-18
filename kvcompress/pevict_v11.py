@@ -36,6 +36,8 @@ _DEFAULTS = {
     "use_vnorm": os.environ.get("PE_USE_VNORM", "1") == "1",
     "win_agg": os.environ.get("PE_WIN_AGG", "sum").lower(),
     "gen_window": int(os.environ.get("PE_GEN_WINDOW", "0")),
+    # 仅用于性能隔离实验：置 1 时跳过压实（结果不正确，只用于计时）
+    "no_compact": int(os.environ.get("PE_NO_COMPACT", "0")),
     "rope_theta": float(os.environ.get("PE_ROPE_THETA", "1e6")),
     "n_future": int(os.environ.get("PE_N_FUTURE", "512")),
 }
@@ -62,6 +64,7 @@ _CAM_MAXSL = 0
 _PROMPT_DONE: set = set()
 # 生成段窗口：记录每个请求「已释放到哪个块下标」，避免每步从头重扫
 _GEN_FROM: dict = {}
+_NULL_ID: list = [None]
 
 
 def _layer_idx(layer) -> int:
@@ -280,6 +283,8 @@ def _make_manager_cls():
             for i in idxs:
                 if i >= len(blocks) or blocks[i] == self._null_block:
                     continue
+                if _NULL_ID[0] is None:
+                    _NULL_ID[0] = getattr(self._null_block, "block_id", None)
                 self.block_pool.free_blocks([blocks[i]])
                 blocks[i] = self._null_block
                 n += 1
@@ -403,6 +408,8 @@ def _build_backend(torch):
             gw = int(_CFG.get("gen_window", 0) or 0)
             if not _RETAINED and gw == 0:
                 return md
+            if int(_CFG.get("no_compact", 0) or 0):
+                return md
             if gw == 0 and _BUILT_VER == _VER:
                 return md
             _BUILT_VER = _VER
@@ -414,43 +421,26 @@ def _build_backend(torch):
             bt, sl = getattr(md, "block_table", None), getattr(md, "seq_lens", None)
             if bt is None or sl is None or bt.numel() == 0:
                 return md
+            null_id = _NULL_ID[0]
+            if null_id is None:
+                return md
             bs = self.kv_cache_spec.block_size
-            new_bt, new_sl = bt.clone(), sl.clone()
-            changed = False
-            for r in range(sl.shape[0]):
-                req_id = _REQ_IDS[r] if r < len(_REQ_IDS) else None
-                if req_id is None:
-                    continue
-                pnb = _prompt_nblk(req_id, bs)
-                if pnb is None:
-                    continue
-                L = int(sl[r].item())
-                nblk = (L + bs - 1) // bs
-                ent = _RETAINED.get(req_id)
-                prompt_keep = set(ent[1]) if ent is not None else set(range(min(pnb, nblk)))
-                gen_from = pnb
-                if gw > 0:
-                    gen_from = max(pnb, min((L - gw) // bs, nblk))
-                idx = sorted({i for i in prompt_keep if i < nblk}
-                             | set(range(gen_from, nblk)))
-                if len(idx) == nblk and idx == list(range(nblk)):
-                    continue
-                if idx:
-                    src = bt[r][torch.tensor(idx, device=bt.device, dtype=torch.long)]
-                    new_bt[r, :len(idx)] = src
-                    new_sl[r] = sum(min(bs, L - i * bs) for i in idx)
-                else:
-                    new_sl[r] = 0
-                new_bt[r, len(idx):] = 0
-                changed = True
-            if changed:
-                md.block_table, md.seq_lens = new_bt, new_sl
-                try:
-                    md.max_seq_len = int(new_sl.max().item())
-                except Exception:
-                    pass
-                _CAM, _CAM_BT, _CAM_SL = common_attn_metadata, new_bt, new_sl
-                _CAM_MAXSL = md.max_seq_len
+            cols = torch.arange(bt.shape[1], device=bt.device).unsqueeze(0)
+            nblk = ((sl + bs - 1) // bs).unsqueeze(1)
+            keep = (bt != null_id) & (cols < nblk)
+            if bool(keep.all()):
+                return md
+            order = torch.argsort(~keep, dim=1, stable=True)
+            new_bt = torch.gather(bt, 1, order)
+            cnt = keep.sum(dim=1, keepdim=True)
+            new_bt = torch.where(cols < cnt, new_bt, torch.zeros_like(new_bt))
+            per_blk = torch.clamp(sl.unsqueeze(1) - cols * bs, min=0, max=bs)
+            new_sl = (per_blk * keep).sum(dim=1).to(sl.dtype)
+            md.block_table, md.seq_lens = new_bt, new_sl
+            try:
+                md.max_seq_len = int(new_sl.max().item())
+            except Exception:
+                pass
             return md
 
     class PromptEvictBackend(TritonAttentionBackend):
