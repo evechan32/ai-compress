@@ -70,6 +70,7 @@ _GW_DBG: list = [0]
 # 每个请求被释放的块下标（metadata 的 block_table 不回读 req_to_blocks，
 # 故不能靠 null 检测，必须由 manager 记录）
 _DROP: dict = {}
+_DROP_T: dict = {}
 _MD_NONE: int = 0
 _MD_OK: int = 0
 
@@ -273,6 +274,16 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
                   f"votes={k_vote} keep={len(_RETAINED[req_id][1])}/{nblk}", flush=True)
 
 
+def _drop_tensor(req_id, d, device):
+    import torch
+
+    t = _DROP_T.get(req_id)
+    if t is None or t.numel() != len(d):
+        t = torch.tensor(sorted(d), device=device, dtype=torch.long)
+        _DROP_T[req_id] = t
+    return t
+
+
 def _prompt_nblk(req_id, bs):
     plen = _PROMPT_LEN.get(req_id)
     return None if plen is None else (plen + bs - 1) // bs
@@ -355,6 +366,7 @@ def _make_manager_cls():
             _PROMPT_DONE.discard(request_id)
             _GEN_FROM.pop(request_id, None)
             _DROP.pop(request_id, None)
+            _DROP_T.pop(request_id, None)
             _RETAINED.pop(request_id, None)
             _IMP_ACC.pop(request_id, None)
             _VOTES.pop(request_id, None)
@@ -455,44 +467,36 @@ def _build_backend(torch):
             if bt is None or sl is None or bt.numel() == 0:
                 return md
             bs = self.kv_cache_spec.block_size
-            new_bt, new_sl = bt.clone(), sl.clone()
-            changed = False
-            for r in range(sl.shape[0]):
+            nrows, C = bt.shape[0], bt.shape[1]
+            cols = torch.arange(C, device=bt.device).unsqueeze(0)
+            nblk = ((sl + bs - 1) // bs).unsqueeze(1)
+            keep = (cols < nblk).expand(nrows, C).clone()
+            touched = 0
+            for r in range(nrows):
                 req_id = _REQ_IDS[r] if r < len(_REQ_IDS) else None
                 if req_id is None:
                     continue
-                dropped = _DROP.get(req_id)
-                if not dropped:
+                d = _DROP.get(req_id)
+                if not d:
                     continue
-                L = int(sl[r].item())
-                nblk = (L + bs - 1) // bs
-                idx = [i for i in range(nblk) if i not in dropped]
-                if len(idx) == nblk:
-                    continue
-                if idx:
-                    src = bt[r][torch.tensor(idx, device=bt.device, dtype=torch.long)]
-                    new_bt[r, :len(idx)] = src
-                    new_sl[r] = sum(min(bs, L - i * bs) for i in idx)
-                else:
-                    new_sl[r] = 0
-                new_bt[r, len(idx):] = 0
-                changed = True
-            if _LOG and _GW_DBG[0] < 14:
-                _GW_DBG[0] += 1
-                rid0 = _REQ_IDS[0] if _REQ_IDS else None
-                print(f"[PE11] bdbg ndrop={len(_DROP)} rid0={rid0} "
-                      f"dropped0={None if rid0 is None else len(_DROP.get(rid0) or ())} "
-                      f"changed={changed} nrow={sl.shape[0]} sl0={int(sl[0])}", flush=True)
+                keep[r].index_fill_(0, _drop_tensor(req_id, d, bt.device), False)
+                touched += 1
+            if touched == 0 and not int(_CFG.get("force_sl", 0) or 0):
+                return md
+            order = torch.argsort(~keep, dim=1, stable=True)
+            new_bt = torch.gather(bt, 1, order)
+            cnt = keep.sum(dim=1, keepdim=True)
+            new_bt = torch.where(cols < cnt, new_bt, torch.zeros_like(new_bt))
+            per_blk = torch.clamp(sl.unsqueeze(1) - cols * bs, min=0, max=bs)
+            new_sl = (per_blk * keep).sum(dim=1).to(sl.dtype)
             fs = int(_CFG.get("force_sl", 0) or 0)
             if fs > 0:
                 new_sl = torch.full_like(new_sl, fs)
-                changed = True
-            if changed:
-                md.block_table, md.seq_lens = new_bt, new_sl
-                try:
-                    md.max_seq_len = int(new_sl.max().item())
-                except Exception:
-                    pass
+            md.block_table, md.seq_lens = new_bt, new_sl
+            try:
+                md.max_seq_len = int(new_sl.max().item())
+            except Exception:
+                pass
             return md
 
     class PromptEvictBackend(TritonAttentionBackend):
