@@ -53,7 +53,6 @@ _Q_LASTL: dict = {}
 _IMP_ACC: dict = {}
 _VOTES: dict = {}
 _LAYER_SEEN: set = set()
-_DBG_SEEN: set = set()
 _VER: int = 0
 _BUILT_VER: int = -1
 # 同一 decode 步内所有 attention 层共享同一份 common_attn_metadata 对象
@@ -62,7 +61,6 @@ _PROMPT_DONE: set = set()
 # 生成段窗口：记录每个请求「已释放到哪个块下标」，避免每步从头重扫
 _GEN_FROM: dict = {}
 _NULL_ID: list = [None]
-_GW_DBG: list = [0]
 # 每个请求被释放的块下标（metadata 的 block_table 不回读 req_to_blocks，
 # 故不能靠 null 检测，必须由 manager 记录）
 _DROP: dict = {}
@@ -72,8 +70,6 @@ _DROP_T: dict = {}
 _CAM = None
 _CAM_BT = None
 _CAM_SL = None
-_MD_NONE: int = 0
-_MD_OK: int = 0
 
 
 def _layer_idx(layer) -> int:
@@ -181,11 +177,6 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
 
     li = _layer_idx(layer)
     cfg = _CFG
-    if _LOG and ("shape",) not in _DBG_SEEN:
-        _DBG_SEEN.add(("shape",))
-        print(f"[PE11] kv_cache.shape={tuple(kv_cache.shape)} "
-              f"query={tuple(query.shape)} key={None if key is None else tuple(key.shape)} "
-              f"Hq={layer.num_heads} Hkv={layer.num_kv_heads} D={layer.head_size}", flush=True)
     if li < 0 or li > _MAX_LAYER:
         return
     bs = int(kv_cache.shape[2])
@@ -216,11 +207,6 @@ def _score_from_cache(layer, query, key, kv_cache, md) -> None:
             continue
         qs, qe = qsl[r], qsl[r + 1]
         bkey = (li, req_id)
-        if _LOG and li == _MAX_LAYER and (req_id, L) not in _DBG_SEEN:
-            _DBG_SEEN.add((req_id, L))
-            blen = None if _Q_BUF.get(bkey) is None else int(_Q_BUF[bkey].shape[0])
-            print(f"[PE11] dbg2 L={L} plen={plen} qs={qs} qe={qe} buf={blen} "
-                  f"retained={req_id in _RETAINED}", flush=True)
         if L <= plen:
             if _Q_LASTL.get(bkey) != L:
                 _Q_LASTL[bkey] = L
@@ -347,11 +333,6 @@ def _make_manager_cls():
                     keep_from = max(pnb, (num_computed_tokens - gw) // bs)
                     tail = min(keep_from, len(blocks))
                     start = max(pnb, _GEN_FROM.get(request_id, pnb))
-                    if _LOG and _GW_DBG[0] < 6:
-                        _GW_DBG[0] += 1
-                        print(f"[PE11] gwdbg L={num_computed_tokens} pnb={pnb} "
-                              f"keep_from={keep_from} tail={tail} start={start} "
-                              f"nblocks={len(blocks)}", flush=True)
                     if start < tail:
                         _GEN_FROM[request_id] = tail
                         before = self.block_pool.get_num_free_blocks()
@@ -416,32 +397,10 @@ def _build_backend(torch):
     class PromptEvictImpl(TritonAttentionImpl):
         def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                     output, *args, **kwargs):
-            global _MAX_LAYER, _MD_NONE, _MD_OK
+            global _MAX_LAYER
             li = _layer_idx(layer)
             if li > _MAX_LAYER:
                 _MAX_LAYER = li
-            global _MD_NONE, _MD_OK
-            try:
-                if attn_metadata is None:
-                    _MD_NONE += 1
-                else:
-                    _MD_OK += 1
-            except Exception:
-                pass
-            if (_LOG and _layer_idx(layer) == _MAX_LAYER
-                    and _GW_DBG[0] < 8 and attn_metadata is not None):
-                _GW_DBG[0] += 1
-                try:
-                    bt = attn_metadata.block_table
-                    print(f"[PE11] idbg li={_layer_idx(layer)} bt0_nz={int((bt[0] != 0).sum())} "
-                          f"seq0={int(attn_metadata.seq_lens[0])} bt0={bt[0,:6].tolist()}",
-                          flush=True)
-                except Exception as e:
-                    print("[PE11] idbg err", type(e).__name__, str(e)[:50], flush=True)
-            if _LOG and (_MD_NONE + _MD_OK) % 400 == 0 and (_MD_NONE + _MD_OK) > 0:
-                print(f"[PE11] mdcnt none={_MD_NONE} ok={_MD_OK} li={_layer_idx(layer)} "
-                      f"has_bt={None if attn_metadata is None else hasattr(attn_metadata, 'block_table')}",
-                      flush=True)
             out = super().forward(layer, query, key, value, kv_cache,
                                   attn_metadata, output, *args, **kwargs)
             if _MODE == "chunkkv" and attn_metadata is not None:
