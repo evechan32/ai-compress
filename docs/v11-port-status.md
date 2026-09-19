@@ -802,3 +802,63 @@ hooks_installed=56    calls=3584    mean_abs_err=0.026    rel=1.81%
 操作过程中系统 python 的 torch 被顺带升级为 **2.13.0+cu130**（需更新驱动，在驱动 530 上报
 "driver is too old"）。所有 vLLM 工作均通过 `PYTHONPATH=/hy-tmp/t29`（torch 2.9.0+cu128）运行，
 不受影响；但**系统 torch 已不适合本机**。
+
+---
+
+## 二十二、int8 KV 在 sm_86 上跑通：**2.0× 容量已验证，但质量崩了**（里程碑 + 待修）
+
+### 为什么走 int8（而非 fp8）
+
+fp8 在 sm_86 上**编译期就不可用**（`fp8e4nv not supported`，见第二十一节），
+而 int8 的反量化数学与 kernel 里已有的 fp8 路径**完全相同**（都是 `x * scale`）。
+
+### 已改动（全部对**已安装的 vLLM** 打补丁，备份在 `/root/vllm-backup/`，可回滚）
+
+| # | 文件 | 改动 |
+|---|---|---|
+| 1 | `utils/torch_utils.py` | `STR_DTYPE_TO_TORCH_DTYPE` 加 `int8` |
+| 2 | `config/cache.py` | `CacheDType` Literal 加 `int8` |
+| 3 | `v1/attention/backends/triton_attn.py` | `supported_kv_cache_dtypes` 加 `int8` |
+| 4 | `attention/ops/triton_unified_attention.py` | K/V 反量化守卫 `is_fp8()` → `is_fp8() or is_int8()`（**两个 kernel 各 2 处，共 4 处**）|
+| 5 | `attention/ops/triton_reshape_and_cache_flash.py` | assert 放行 int8；新增 `INT8_KV_CACHE` constexpr；**写入端 clamp 到 ±127** |
+
+**关键坑**：int8 溢出会**回绕**（fp8 只饱和）⇒ 必须显式 clamp。
+（未加 clamp 时输出是乱码 `' The p. The\n\n The...'`；加了之后变连贯 ✅）
+
+### 已验证的成果
+
+**① 内存 2.0×（引擎内实测，同 gmem=0.30）**
+
+| KV dtype | 可用 KV 显存 | **KV 池容量** |
+|---|---|---|
+| bf16 | 3.49 GiB | 130,544 tokens |
+| **int8** | 3.49 GiB | **261,104 tokens（2.0×）** ✅ |
+
+**② 能跑通且输出连贯**（`exit=0`，文本合理）
+
+### 未通过：质量崩了
+
+| 配置 | NIAH (5 深度 × 8) |
+|---|---|
+| bf16 | **40/40** |
+| **int8** | **0/40** ❌ |
+
+**这与数值模拟的结论矛盾**（模拟：NIAH 20/20、F1 逐位相同）⇒ **真实实现里存在数值缺陷**：
+
+- 模拟用的是**每次调用的动态 scale**；vLLM 用的是 `calc_kv_scales` **首次前向算一次**的静态 scale
+- 且 `Q/K/V_SCALE_CONSTANT` 默认 **200/200/100**，只把 K 设成 127 并不完整
+- 嫌疑：**还有某条写入/读取路径未被正确量化**，或静态 scale 不适配实际数据分布
+
+### 结论与下一步
+
+- **可行性已证**：int8 KV 在 sm_86 上能跑、内存 **精确 2.0×**；数值模拟表明**质量代价可忽略**
+- **实现尚不正确**：质量 0/40，需要定位剩余的未量化路径 / scale 处理
+- 修复方向：① 逐条确认写入路径（是否所有 prefill/decode 写入都走 patch 过的 kernel）
+  ② 改用**动态 scale**（对齐模拟的设置）③ 用**标定**得到的 scale
+
+### 当前环境状态
+
+vLLM 已被打补丁（`/hy-tmp/t29/vllm`），**备份在 `/root/vllm-backup/`**：
+`torch_utils.py` / `cache.py` / `triton_attn.py` / `triton_reshape_and_cache_flash.py` /
+`triton_unified_attention.py`（另有 clamp 前的中间版本 `rc_before_clamp.py`）。
+回滚：`cp /root/vllm-backup/<file> /hy-tmp/t29/vllm/<path>`。

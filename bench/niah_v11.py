@@ -47,8 +47,13 @@ def build_prompts(tok):
 
 def main():
     mode = os.environ["PE_MODE"]
-    llm = LLM(model=MODEL, max_model_len=8192, gpu_memory_utilization=0.6,
-              enforce_eager=True, max_num_seqs=4, disable_log_stats=True)
+    _kw = {}
+    if os.environ.get("PE_KVDTYPE"):
+        _kw["kv_cache_dtype"] = os.environ["PE_KVDTYPE"]
+        _kw["calculate_kv_scales"] = True
+    llm = LLM(model=MODEL, max_model_len=8192,
+              gpu_memory_utilization=float(os.environ.get("PE_GMEM", "0.6")),
+              enforce_eager=True, max_num_seqs=4, disable_log_stats=True, **_kw)
     tok = llm.get_tokenizer()
     sp = SamplingParams(max_tokens=24, temperature=0.0)
     samples = build_prompts(tok)
