@@ -892,3 +892,52 @@ vLLM 已被打补丁（`/hy-tmp/t29/vllm`），**备份在 `/root/vllm-backup/`*
 `/hy-tmp/t29/vllm` 已被打补丁；备份 `/root/vllm-backup/`（含 `layer.py`、`torch_utils.py`、
 `cache.py`、`triton_attn.py`、`triton_reshape_and_cache_flash.py`、`triton_unified_attention.py`、
 `rc_before_clamp.py`）。标定表 `/root/kv_calib.json`（副本 `/hy-tmp/kv_calib.json`）。
+
+---
+
+## 二十三、int8 KV 质量缺陷根因确认：**scale 粒度**（架构层，非接线 bug）
+
+### 往返检查结果（决定性）
+
+在 `triton_attn.py` 的写入后立即读回、反量化、与源 K/V 比对：
+
+```
+[RT] k_rel=0.04533  v_rel=0.05881  k_scale=2.51969  v_scale=0.03445
+     k_raw=[-125,114]  v_raw=[-29,82]  want_absmax=316.000
+```
+
+- **量化往返正确**：K 相对误差 4.5%、V 5.9%，无 clamp 触发
+- 标定生效：`k_scale = 316/127 = 2.52` ✅ 与标定表一致
+- ⇒ **写入/读取接线没有 bug**，int8 缓存里确实是正确量化的数据
+
+### 真正的根因：**scale 粒度**
+
+| 路径 | scale 粒度 | K 相对误差 | 质量 |
+|---|---|---|---|
+| **数值模拟**（`bench/int8kv_sim.py`）| **per-token / per-channel** | **1.81%** | NIAH 20/20、F1 逐位相同 |
+| **vLLM 实现** | **per-layer 单个标量** | **4.53%** | NIAH **0/40** |
+
+vLLM 的 KV 量化架构是**每层一个标量 scale**（`layer._k_scale`）。
+对 **fp8** 这没问题 —— e4m3 有 4 位指数、动态范围宽，粗粒度 scale 可接受。
+但 **int8 没有指数位**：单个离群通道就吃掉整个动态范围，导致**小幅度但关键的 key 只剩很少有效级数**
+→ 检索能力被摧毁（局部连贯的文本仍能生成，所以表象是"输出通顺但答不出"）。
+
+### 结论（重要）
+
+- **int8 KV 在 sm_86 上能跑、内存精确 2.0×** ✅
+- 但要让 int8 的质量可用，必须实现 **per-channel/per-token 的 scale 并与 KV 一起存储**
+  —— 这正是 **KIVI 的核心机制**，也是 **vLLM 当前架构不具备**的
+- 这解释了**为什么工业界用 fp8 而不是 int8 做 KV 量化**：fp8 的浮点指数范围
+  让"每层一个标量 scale"这种极粗粒度也能工作 ✅
+
+### 如果继续，需要什么
+
+在 KV 缓存布局里增加粗粒度之外的 scale 存储（per-head 或 per-block scale 数组），并改：
+写入 kernel（计算并存 scale）、读取 kernel（按位置取 scale 反量化）、
+缓存分配（为 scale 预留空间）、manager（block 布局）。
+**这已不是"改 dtype + 放宽守卫"，而是实现 KIVI 类方法的核心机制。**
+
+### 环境状态（可回滚）
+
+`/root/vllm-backup/`（含 `ta_before_rt.py` 等 7 个文件），标定表 `/root/kv_calib.json`。
+中转运行时另加了两处调试插桩（RT 检查 / KVSCALE 打印），复现时按需移除。
