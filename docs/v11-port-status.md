@@ -730,3 +730,75 @@ gw256 只产出 28k token、墙钟却与 off 相同 → "变慢"纯粹是因为*
 - 但**在吞吐上没看到收益**（此形状），且**峰值未测**
 - 因此这条"降低 prefill 峰值"的路，**目前证据不足以支持继续投入**；
   若仍要做，先解决峰值测量这一关。
+
+---
+
+## 二十一、KV 量化可行性：sm_86 上 fp8 不可用，但 **int8 数值上可用**（新发现）
+
+### ① sm_86 的 fp8 KV：**硬性不可用**（已实测，含编译器错误）
+
+强开 `supports_fp8()` 后：
+
+```
+fp8_e4m3 → triton.compiler.errors.CompilationError:
+   ValueError("type fp8e4nv not supported in this architecture.
+               The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")
+fp8_e5m2 → AssertionError: assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
+```
+
+vLLM 的 fp8 KV 路径要的是 **`fp8e4nv`**（sm_89+ 的 e4m3 变体），**Triton 在 sm_86 上编不出来**；
+sm_86 只支持 `fp8e4b15` / `fp8e5`，而 vLLM 的 kernel 断言又只接受 `{fp8, fp8_e4m3}`。
+⇒ **动态算 scale（`--calculate-kv-scales`）在这台机器上连执行都到不了**，谈不上测劣化。
+
+### ② 关键洞察：反量化数学与 int8 完全相同
+
+vLLM 的两个 Triton kernel 里，量化路径就是**一句乘法**：
+
+```python
+triton_unified_attention.py:250  if K_load.dtype.is_fp8():
+:254                                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+triton_reshape_and_cache_flash.py:57  key_tile = key_load if ... else key_load / k_scale
+```
+
+**对称 int8（zero-point=0）的反量化也是 `x * scale`** ⇒ 注意力 kernel 的数学**已经就位**，
+只需放宽 `is_fp8()` 守卫 + 改 dtype 映射 + 改写入量化 + 改 scale 公式（max_abs/127 而非 /448）。
+
+### ③ 先做数值等效模拟（不碰内核）拿到"掉多少质量/慢多少"
+
+`bench/int8kv_sim.py`：在 `k_proj`/`v_proj` 输出上插 hook 做 int8 量化→反量化
+（KIVI 式：**K 按 channel、V 按 token**）。这与"KV 池存 int8 + 读取反量化"的**数值路径完全一致**。
+
+自检（证明 hook 生效、非空操作）：
+
+```
+hooks_installed=56    calls=3584    mean_abs_err=0.026    rel=1.81%
+```
+
+**质量**（Qwen2.5-1.5B, HF, greedy）：
+
+| 指标 | bf16 | **int8 (K-perchan, V-pertoken)** |
+|---|---|---|
+| NIAH（20 条） | 20/20 | **20/20** |
+| LongBench qasper (n=20) | 0.3453 | **0.3453** |
+| LongBench multifieldqa_en (n=20) | 0.3917 | **0.3917** |
+
+**口径**：F1 在 n=20 下逐位相同是强证据但样本小；要下定论需 n=60/任务 + 配对 CI（同我们之前的做法）。
+
+**开销**：hook 级每样本 0.70s → 0.79~1.20s（+13%~70%，波动大）。
+**注意**：这是 PyTorch hook 的开销（量化/反量化是两个独立算子 + 额外显存往返），
+**不代表融合进 kernel 的成本** —— 融合后应显著更低（e4m3 路径在 sm_89 上的实测开销约 5%）。
+
+**显存**：2×（按构造，未在引擎内实测）。
+
+### 结论
+
+- **fp8 KV 在 sm_86：不可用**（编译器层面）
+- **int8 KV 在 sm_86：数值上可用** —— 相对 K/V 误差仅 1.81%，质量无可测损失
+- 因此**写 int8 KV kernel 是值得的**，且注意力的反量化数学**在 vLLM 里已经存在**（被 `is_fp8()` 挡住）
+- 这是唯一能在这台机器上**直接压 prefill 峰值 2×** 的路径
+
+### 副作用记录（需知晓）
+
+操作过程中系统 python 的 torch 被顺带升级为 **2.13.0+cu130**（需更新驱动，在驱动 530 上报
+"driver is too old"）。所有 vLLM 工作均通过 `PYTHONPATH=/hy-tmp/t29`（torch 2.9.0+cu128）运行，
+不受影响；但**系统 torch 已不适合本机**。
