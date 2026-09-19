@@ -29,9 +29,26 @@ QE = os.environ.get("PE_KVQ", "none")   # none | pertensor | perchan
 FILLER = "The harbor master logged every vessel that passed the north pier. "
 
 
-def qdq(x, dim):
-    """对称 int8 量化→反量化。dim 指定 scale 的归约维（K 用 -1 即 channel，V 用 -2 即 token）。"""
-    s = x.abs().amax(dim=dim, keepdim=True).clamp_min(1e-8) / 127.0
+FIXED_SCALE = {}  # 全局标量模式：完全复刻 vLLM（每层一个标量、只算一次）
+
+
+def qdq(x, dim, key=None):
+    """对称 int8 量化→反量化。
+
+    dim=None   → 整个张量一个标量（= per-layer 标量，粗粒度）
+    dim=-1     → 每 token 一个标量
+    dim=-2     → 每 channel 一个标量
+    key 不为空且 FIXED_SCALE 已缓存 → 用缓存的全局标量（复刻 vLLM 的"只算一次"）
+    """
+    if dim is None:
+        if key is not None and key in FIXED_SCALE:
+            s = FIXED_SCALE[key]
+        else:
+            s = x.abs().amax().clamp_min(1e-8) / 127.0
+            if key is not None:
+                FIXED_SCALE[key] = s
+    else:
+        s = x.abs().amax(dim=dim, keepdim=True).clamp_min(1e-8) / 127.0
     q = torch.clamp(torch.round(x / s), -127, 127)
     return q * s
 
@@ -48,10 +65,18 @@ def install_hooks(model, mode):
             continue
         is_k = name.endswith("k_proj")
         # KIVI：K 按 channel(-1)，V 按 token(-2)；perchan 模式用这个，pertensor 用全张量
-        dim = (-1,) if (mode == "pertensor") else ((-1,) if is_k else (-2,))
+        if mode == "layer_fixed":
+            dim = None
+        elif mode == "layer_percall":
+            dim = None
+        elif mode == "pertoken":
+            dim = (-1,)
+        else:  # perchan：K 按 channel、V 按 token
+            dim = (-2,) if is_k else (-2,)
+        _key = (name, mode) if mode == "layer_fixed" else None
 
-        def hook(m, inp, out, dim=dim):
-            y = qdq(out, dim)
+        def hook(m, inp, out, dim=dim, _key=_key):
+            y = qdq(out, dim, _key)
             STATS[0] += 1
             STATS[1] += float((y - out).abs().mean())
             STATS[2] += float(out.abs().mean())
