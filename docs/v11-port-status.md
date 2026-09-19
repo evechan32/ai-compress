@@ -862,3 +862,33 @@ vLLM 已被打补丁（`/hy-tmp/t29/vllm`），**备份在 `/root/vllm-backup/`*
 `torch_utils.py` / `cache.py` / `triton_attn.py` / `triton_reshape_and_cache_flash.py` /
 `triton_unified_attention.py`（另有 clamp 前的中间版本 `rc_before_clamp.py`）。
 回滚：`cp /root/vllm-backup/<file> /hy-tmp/t29/vllm/<path>`。
+
+### 二十二补充：质量缺陷的定位进展（scale 已排除）
+
+**已排除**：KV scale 的标定来源问题。
+
+诊断显示 `calc_kv_scales` 是在 **8192 token 的剖析/预热假数据**上计算的
+（`key.shape=(8192,256)`），然后被冻结；而真实数据的 absmax 明显更大：
+
+| 层 | 假数据 K absmax | 真实 K absmax | 低估 |
+|---|---|---|---|
+| 2 | 17.5 | 24.1 | 1.4× |
+| 3 | 6.84 | **22.4** | **3.3×** |
+| 4 | 5.53 | **18.8** | 3.4× |
+
+用假数据的 scale 量化真实 KV → `K·127/max_dummy` 最大到 ~416 → **被 clamp 到 127** → 严重失真。
+
+**已实施修法**：离线标定 28 层的真实 absmax（`/root/kv_calib.json`，即 `bench/int8kv_sim.py`
+同思路的 vLLM 版），并把 `calc_kv_scales` 改为**读标定表**（`attention/layer.py`）。
+
+**结果：仍然 0/40** ⇒ **scale 不是根因**，还有第二个缺陷。
+
+**0/40 是灾难性失真**（不是精度不足）—— 数值模拟同粒度是 20/20，说明**接线有结构性错误**。
+下一步（未做）：验证 KV 缓存的**往返数值**（dump int8 缓存 → 用 scale 反量化 → 与源 K/V 比较）；
+我第一次尝试因缓存布局假设错误（IndexError）未成，需先确认 `self.kv_cache` 的实际结构。
+
+### 当前环境状态（可回滚）
+
+`/hy-tmp/t29/vllm` 已被打补丁；备份 `/root/vllm-backup/`（含 `layer.py`、`torch_utils.py`、
+`cache.py`、`triton_attn.py`、`triton_reshape_and_cache_flash.py`、`triton_unified_attention.py`、
+`rc_before_clamp.py`）。标定表 `/root/kv_calib.json`（副本 `/hy-tmp/kv_calib.json`）。
